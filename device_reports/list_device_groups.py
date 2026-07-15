@@ -77,23 +77,29 @@ def _request_with_retry(func_name: str, url: str, headers: dict, params: dict) -
 
 
 def get_device_groups(token: str, domain_id: str | None = None) -> list[dict]:
-    """Fetch all device groups, following pagination until exhausted."""
+    """Fetch all device groups, following pagination until exhausted.
+
+    This endpoint uses cursor-token pagination: the "start" query param
+    takes the literal "next" (or "previous") token string returned by the
+    prior response. It is NOT an item offset or a page index -- passing
+    anything else silently returns page 1 every time.
+    """
     url = f"{BASE_URL}/device-groups"
     headers = {"Authorization": f"Bearer {token}"}
     if domain_id:
         headers["x-singlewire-domain"] = domain_id
 
-    seen_ids = set()
     all_groups = []
     limit = 100
-    page_num = 0  # NOTE: this endpoint appears to treat "offset" as a page
-    # index (0, 1, 2, ...) rather than a record count to skip -- offset=100
-    # returned an identical page to offset=0 with limit=100, which rules out
-    # item-count semantics.
+    start_token = None
     total = None
+    page_num = 0
 
     while True:
-        params = {"limit": limit, "offset": page_num, "include-total": "true"}
+        params = {"limit": limit}
+        if start_token is not None:
+            params["start"] = start_token
+
         try:
             resp = _request_with_retry("get_device_groups", url, headers, params)
         except RequestException as e:
@@ -105,17 +111,12 @@ def get_device_groups(token: str, domain_id: str | None = None) -> list[dict]:
         payload = resp.json()
         page = payload.get("data", [])
         total = payload.get("total", total)
+        next_token = payload.get("next")
 
         if DEBUG:
-            meta = {k: v for k, v in payload.items() if k != "data"}
-            interesting_headers = {
-                k: v
-                for k, v in resp.headers.items()
-                if k.lower() in ("link", "content-range", "x-total-count", "range")
-            }
             print(
                 f"[DEBUG] get_device_groups page {page_num}: "
-                f"{len(page)} records, meta={meta}, headers={interesting_headers}, "
+                f"{len(page)} records, total={total}, next={next_token!r}, "
                 f"first id={page[0].get('id') if page else None}",
                 file=sys.stderr,
             )
@@ -123,26 +124,15 @@ def get_device_groups(token: str, domain_id: str | None = None) -> list[dict]:
         if not page:
             break
 
-        new_records = [g for g in page if g.get("id") not in seen_ids]
-        if not new_records:
-            if DEBUG:
-                print(
-                    f"[DEBUG] get_device_groups page {page_num} contained "
-                    "no new records; stopping.",
-                    file=sys.stderr,
-                )
-            break
-
-        for g in new_records:
-            seen_ids.add(g.get("id"))
-        all_groups.extend(new_records)
+        all_groups.extend(page)
 
         if total is not None and len(all_groups) >= total:
             break
 
-        if len(page) < limit:
+        if not next_token:
             break
 
+        start_token = next_token
         page_num += 1
 
         # Small pause between pages to stay under rate limits.
