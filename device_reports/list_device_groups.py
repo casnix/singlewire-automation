@@ -13,6 +13,7 @@ Usage:
     # acting domain, set INFORMACAST_DOMAIN to that domain's id.
 """
 
+import argparse
 import os
 import sys
 import time
@@ -25,11 +26,27 @@ BASE_URL = "https://api.icmobile.singlewire.com/api/v1"
 MAX_RETRIES = 6
 BASE_BACKOFF_SECONDS = 2  # doubles each retry: 2, 4, 8, 16, 32, 64
 
+DEBUG = False
 
-def _request_with_retry(url: str, headers: dict, params: dict) -> requests.Response:
+
+def _log(func_name: str, url: str, params: dict, status) -> None:
+    if not DEBUG:
+        return
+    # Build the URI with query string, no headers.
+    if params:
+        query = "&".join(f"{k}={v}" for k, v in params.items())
+        uri = f"{url}?{query}"
+    else:
+        uri = url
+    status_str = "OK" if status == 200 else str(status)
+    print(f"[DEBUG] {func_name} {uri} -> {status_str}", file=sys.stderr)
+
+
+def _request_with_retry(func_name: str, url: str, headers: dict, params: dict) -> requests.Response:
     """GET with retry/backoff on 429 (and transient 5xx)."""
     for attempt in range(MAX_RETRIES + 1):
         resp = requests.get(url, headers=headers, params=params, timeout=15)
+        _log(func_name, url, params, resp.status_code)
 
         if resp.status_code == 429 or resp.status_code >= 500:
             if attempt == MAX_RETRIES:
@@ -71,7 +88,7 @@ def get_device_groups(token: str, domain_id: str | None = None) -> list[dict]:
 
     while True:
         try:
-            resp = _request_with_retry(url, headers, params)
+            resp = _request_with_retry("get_device_groups", url, headers, params)
         except RequestException as e:
             print(f"Error fetching device groups: {e}", file=sys.stderr)
             if getattr(e, "response", None) is not None:
@@ -96,6 +113,17 @@ def get_device_groups(token: str, domain_id: str | None = None) -> list[dict]:
 
 
 def main():
+    global DEBUG
+
+    parser = argparse.ArgumentParser(description="List InformaCast Fusion device group names.")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Log each API call (function, URI, status code) to stderr.",
+    )
+    args = parser.parse_args()
+    DEBUG = args.debug
+
     token = os.environ.get("INFORMACAST_TOKEN")
     if not token:
         print("Set INFORMACAST_TOKEN in your environment first.", file=sys.stderr)
