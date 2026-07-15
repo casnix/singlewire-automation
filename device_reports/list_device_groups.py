@@ -84,9 +84,12 @@ def get_device_groups(token: str, domain_id: str | None = None) -> list[dict]:
         headers["x-singlewire-domain"] = domain_id
 
     all_groups = []
-    params = {"limit": 100, "offset": 0}
+    limit = 100
+    offset = 0
+    total = None
 
     while True:
+        params = {"limit": limit, "offset": offset}
         try:
             resp = _request_with_retry("get_device_groups", url, headers, params)
         except RequestException as e:
@@ -97,14 +100,33 @@ def get_device_groups(token: str, domain_id: str | None = None) -> list[dict]:
 
         payload = resp.json()
         page = payload.get("data", [])
+        total = payload.get("total", total)
+
+        if not page:
+            break
+
         all_groups.extend(page)
 
-        # The API's pagination wrapper exposes a "next" cursor/offset;
-        # stop once there isn't one or the page came back empty.
-        next_cursor = payload.get("next")
-        if not next_cursor or not page:
+        # Stop once we've collected everything the API says exists.
+        if total is not None and len(all_groups) >= total:
             break
-        params["offset"] = next_cursor
+
+        # A short page (fewer records than requested) also signals the end.
+        if len(page) < limit:
+            break
+
+        # Advance the offset ourselves by how many records we actually got,
+        # rather than trusting the API's "next" field literally -- if the
+        # server ever returns a "next" that doesn't move forward, that would
+        # otherwise loop forever.
+        new_offset = offset + len(page)
+        if new_offset <= offset:
+            print(
+                f"Pagination did not advance (offset stuck at {offset}); stopping.",
+                file=sys.stderr,
+            )
+            break
+        offset = new_offset
 
         # Small pause between pages to stay under rate limits.
         time.sleep(0.5)
