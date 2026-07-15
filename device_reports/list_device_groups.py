@@ -83,13 +83,17 @@ def get_device_groups(token: str, domain_id: str | None = None) -> list[dict]:
     if domain_id:
         headers["x-singlewire-domain"] = domain_id
 
+    seen_ids = set()
     all_groups = []
     limit = 100
     offset = 0
     total = None
 
     while True:
-        params = {"limit": limit, "offset": offset}
+        # include-total=true is required for the API to populate "total"
+        # at all (per Singlewire's changelog); without it the field is
+        # absent/unreliable.
+        params = {"limit": limit, "offset": offset, "include-total": "true"}
         try:
             resp = _request_with_retry("get_device_groups", url, headers, params)
         except RequestException as e:
@@ -105,28 +109,32 @@ def get_device_groups(token: str, domain_id: str | None = None) -> list[dict]:
         if not page:
             break
 
-        all_groups.extend(page)
+        # Only keep records we haven't already collected. If the server
+        # ignored/clamped our offset and handed back a page we've already
+        # seen in full, new_records will be empty and we stop -- this is
+        # what actually prevents the infinite loop, regardless of what
+        # "offset" turns out to mean on this endpoint.
+        new_records = [g for g in page if g.get("id") not in seen_ids]
+        if not new_records:
+            if DEBUG:
+                print(
+                    f"[DEBUG] get_device_groups page at offset={offset} "
+                    "contained no new records; stopping.",
+                    file=sys.stderr,
+                )
+            break
 
-        # Stop once we've collected everything the API says exists.
+        for g in new_records:
+            seen_ids.add(g.get("id"))
+        all_groups.extend(new_records)
+
         if total is not None and len(all_groups) >= total:
             break
 
-        # A short page (fewer records than requested) also signals the end.
         if len(page) < limit:
             break
 
-        # Advance the offset ourselves by how many records we actually got,
-        # rather than trusting the API's "next" field literally -- if the
-        # server ever returns a "next" that doesn't move forward, that would
-        # otherwise loop forever.
-        new_offset = offset + len(page)
-        if new_offset <= offset:
-            print(
-                f"Pagination did not advance (offset stuck at {offset}); stopping.",
-                file=sys.stderr,
-            )
-            break
-        offset = new_offset
+        offset += limit
 
         # Small pause between pages to stay under rate limits.
         time.sleep(0.5)
