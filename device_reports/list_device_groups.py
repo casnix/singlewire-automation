@@ -107,10 +107,15 @@ def get_device_groups(token: str, domain_id: str | None = None) -> list[dict]:
         total = payload.get("total", total)
 
         if DEBUG:
+            meta = {k: v for k, v in payload.items() if k != "data"}
+            interesting_headers = {
+                k: v
+                for k, v in resp.headers.items()
+                if k.lower() in ("link", "content-range", "x-total-count", "range")
+            }
             print(
                 f"[DEBUG] get_device_groups page {page_num}: "
-                f"{len(page)} records, total={payload.get('total')}, "
-                f"next={payload.get('next')!r}, previous={payload.get('previous')!r}, "
+                f"{len(page)} records, meta={meta}, headers={interesting_headers}, "
                 f"first id={page[0].get('id') if page else None}",
                 file=sys.stderr,
             )
