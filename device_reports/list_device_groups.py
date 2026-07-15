@@ -15,11 +15,48 @@ Usage:
 
 import os
 import sys
+import time
 
 import requests
 from requests.exceptions import RequestException
 
 BASE_URL = "https://api.icmobile.singlewire.com/api/v1"
+
+MAX_RETRIES = 6
+BASE_BACKOFF_SECONDS = 2  # doubles each retry: 2, 4, 8, 16, 32, 64
+
+
+def _request_with_retry(url: str, headers: dict, params: dict) -> requests.Response:
+    """GET with retry/backoff on 429 (and transient 5xx)."""
+    for attempt in range(MAX_RETRIES + 1):
+        resp = requests.get(url, headers=headers, params=params, timeout=15)
+
+        if resp.status_code == 429 or resp.status_code >= 500:
+            if attempt == MAX_RETRIES:
+                resp.raise_for_status()
+
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    wait = float(retry_after)
+                except ValueError:
+                    wait = BASE_BACKOFF_SECONDS * (2 ** attempt)
+            else:
+                wait = BASE_BACKOFF_SECONDS * (2 ** attempt)
+
+            print(
+                f"Got {resp.status_code}, retrying in {wait:.1f}s "
+                f"(attempt {attempt + 1}/{MAX_RETRIES})...",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
+            continue
+
+        resp.raise_for_status()
+        return resp
+
+    resp.raise_for_status()
+    return resp
 
 
 def get_device_groups(token: str, domain_id: str | None = None) -> list[dict]:
@@ -34,8 +71,7 @@ def get_device_groups(token: str, domain_id: str | None = None) -> list[dict]:
 
     while True:
         try:
-            resp = requests.get(url, headers=headers, params=params, timeout=15)
-            resp.raise_for_status()
+            resp = _request_with_retry(url, headers, params)
         except RequestException as e:
             print(f"Error fetching device groups: {e}", file=sys.stderr)
             if getattr(e, "response", None) is not None:
@@ -52,6 +88,9 @@ def get_device_groups(token: str, domain_id: str | None = None) -> list[dict]:
         if not next_cursor or not page:
             break
         params["offset"] = next_cursor
+
+        # Small pause between pages to stay under rate limits.
+        time.sleep(0.5)
 
     return all_groups
 
