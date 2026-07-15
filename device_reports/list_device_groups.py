@@ -86,14 +86,14 @@ def get_device_groups(token: str, domain_id: str | None = None) -> list[dict]:
     seen_ids = set()
     all_groups = []
     limit = 100
-    offset = 0
+    page_num = 0  # NOTE: this endpoint appears to treat "offset" as a page
+    # index (0, 1, 2, ...) rather than a record count to skip -- offset=100
+    # returned an identical page to offset=0 with limit=100, which rules out
+    # item-count semantics.
     total = None
 
     while True:
-        # include-total=true is required for the API to populate "total"
-        # at all (per Singlewire's changelog); without it the field is
-        # absent/unreliable.
-        params = {"limit": limit, "offset": offset, "include-total": "true"}
+        params = {"limit": limit, "offset": page_num, "include-total": "true"}
         try:
             resp = _request_with_retry("get_device_groups", url, headers, params)
         except RequestException as e:
@@ -106,20 +106,22 @@ def get_device_groups(token: str, domain_id: str | None = None) -> list[dict]:
         page = payload.get("data", [])
         total = payload.get("total", total)
 
+        if DEBUG and page:
+            print(
+                f"[DEBUG] get_device_groups page {page_num}: "
+                f"{len(page)} records, first id={page[0].get('id')}",
+                file=sys.stderr,
+            )
+
         if not page:
             break
 
-        # Only keep records we haven't already collected. If the server
-        # ignored/clamped our offset and handed back a page we've already
-        # seen in full, new_records will be empty and we stop -- this is
-        # what actually prevents the infinite loop, regardless of what
-        # "offset" turns out to mean on this endpoint.
         new_records = [g for g in page if g.get("id") not in seen_ids]
         if not new_records:
             if DEBUG:
                 print(
-                    f"[DEBUG] get_device_groups page at offset={offset} "
-                    "contained no new records; stopping.",
+                    f"[DEBUG] get_device_groups page {page_num} contained "
+                    "no new records; stopping.",
                     file=sys.stderr,
                 )
             break
@@ -134,7 +136,7 @@ def get_device_groups(token: str, domain_id: str | None = None) -> list[dict]:
         if len(page) < limit:
             break
 
-        offset += limit
+        page_num += 1
 
         # Small pause between pages to stay under rate limits.
         time.sleep(0.5)
