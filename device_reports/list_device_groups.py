@@ -106,10 +106,12 @@ def get_device_groups(token: str, domain_id: str | None = None) -> list[dict]:
         page = payload.get("data", [])
         total = payload.get("total", total)
 
-        if DEBUG and page:
+        if DEBUG:
             print(
                 f"[DEBUG] get_device_groups page {page_num}: "
-                f"{len(page)} records, first id={page[0].get('id')}",
+                f"{len(page)} records, total={payload.get('total')}, "
+                f"next={payload.get('next')!r}, previous={payload.get('previous')!r}, "
+                f"first id={page[0].get('id') if page else None}",
                 file=sys.stderr,
             )
 
