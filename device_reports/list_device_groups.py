@@ -14,7 +14,9 @@ Usage:
 """
 
 import argparse
+import json
 import os
+import re
 import sys
 import time
 
@@ -141,6 +143,87 @@ def get_device_groups(token: str, domain_id: str | None = None) -> list[dict]:
     return all_groups
 
 
+def _describe_filter(f: dict) -> str:
+    """Render a single filter rule as a readable string, e.g. Name CONTAINS 'Lobby'."""
+    attr = f.get("attribute")
+    comparison = f.get("comparison")
+    value = f.get("value")
+    text = f"{attr} {comparison} '{value}'"
+    if f.get("complement"):
+        text = f"NOT ({text})"
+    if f.get("caseSensitive"):
+        text += " [case-sensitive]"
+    return text
+
+
+def _build_filter_logic_string(group: dict) -> str | None:
+    """Return a readable filter_logic string if this group has filter rules, else None."""
+    filters = group.get("filters")
+    if not filters:
+        return None
+
+    descriptions = [_describe_filter(f) for f in filters]
+    filter_type = group.get("filterType")
+
+    if filter_type == "LOGICAL_EXPRESSION":
+        expr = group.get("logicalExpression") or ""
+
+        def _sub(match: re.Match) -> str:
+            idx = int(match.group(0))
+            if 0 <= idx < len(descriptions):
+                return f"({descriptions[idx]})"
+            return match.group(0)
+
+        return re.sub(r"\d+", _sub, expr)
+
+    if filter_type in ("AND", "OR"):
+        return f" {filter_type} ".join(descriptions)
+
+    # ACCEPT / REJECT or any other/unknown type: just list the rules with the type as a label
+    return f"{filter_type}: " + "; ".join(descriptions)
+
+
+def _summarize_device(device: dict) -> dict:
+    """Pull out the fields most useful for identifying a device in output."""
+    attributes = device.get("attributes") or {}
+    return {
+        "id": device.get("id"),
+        "name": attributes.get("Name") or device.get("description"),
+        "type": device.get("type"),
+        "deviceIdentifier": device.get("deviceIdentifier"),
+    }
+
+
+def build_dive_output(groups: list[dict]) -> dict:
+    """Reshape raw device group records into the requested {name: {...}} schema.
+
+    NOTE: member_devices reflects only each group's explicit "additions" --
+    devices added by ID. The InformaCast API does not expose the resolved
+    set of devices that a filter-based (dynamic) group currently matches,
+    only the filter rules themselves and, optionally, match *counts*
+    (numPhones/numIdns/numSpeakers/numPlugins via includeDeviceCounts).
+    So for purely filter-driven groups, member_devices may be empty even
+    though the group matches devices at notification time.
+    """
+    result = {}
+    for group in groups:
+        name = group.get("name") or group.get("id")
+
+        entry = {
+            "member_devices": [
+                _summarize_device(d) for d in group.get("additions", [])
+            ],
+        }
+
+        filter_logic = _build_filter_logic_string(group)
+        if filter_logic is not None:
+            entry["filter_logic"] = filter_logic
+
+        result[name] = entry
+
+    return result
+
+
 def main():
     global DEBUG
 
@@ -149,6 +232,14 @@ def main():
         "--debug",
         action="store_true",
         help="Log each API call (function, URI, status code) to stderr.",
+    )
+    parser.add_argument(
+        "--dive",
+        action="store_true",
+        help=(
+            "Output a JSON document with each device group's member_devices "
+            "and, if defined with a filter, its filter_logic."
+        ),
     )
     args = parser.parse_args()
     DEBUG = args.debug
@@ -163,7 +254,14 @@ def main():
     groups = get_device_groups(token, domain_id)
 
     if not groups:
-        print("No device groups found.")
+        if args.dive:
+            print(json.dumps({}, indent=2))
+        else:
+            print("No device groups found.")
+        return
+
+    if args.dive:
+        print(json.dumps(build_dive_output(groups), indent=2))
         return
 
     for group in groups:
