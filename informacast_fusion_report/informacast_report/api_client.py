@@ -23,6 +23,12 @@ DEFAULT_PAGE_LIMIT = 100
 MAX_RETRIES = 5
 BACKOFF_BASE_SECONDS = 1.5
 
+# Safety valve for pagination. A well-behaved endpoint will stop advancing
+# `next`/`partial` once exhausted; this exists purely to turn a server-side
+# bug or a misread response envelope into a loud, early failure instead of
+# a script that quietly hangs fetching the same data forever.
+MAX_PAGES_PER_RESOURCE = 2000
+
 
 class ApiError(RuntimeError):
     def __init__(self, message: str, status_code: Optional[int] = None, path: str = ""):
@@ -68,16 +74,24 @@ class FusionApiClient:
         attempt = 0
         while True:
             attempt += 1
-            logger.debug("GET %s params=%s domain=%s", url, params, domain_id)
+            call_start = time.monotonic()
+            logger.debug("GET %s params=%s domain=%s attempt=%d", url, params, domain_id, attempt)
             try:
                 resp = self.session.get(
                     url, params=params, headers=headers, timeout=self.timeout
                 )
             except requests.RequestException as exc:
+                logger.debug("Network error on attempt %d for %s: %s", attempt, url, exc)
                 if attempt >= MAX_RETRIES:
                     raise ApiError(f"Network error calling {url}: {exc}", path=path) from exc
                 self._sleep_backoff(attempt)
                 continue
+
+            elapsed_ms = (time.monotonic() - call_start) * 1000
+            logger.debug(
+                "  -> %d in %.0fms (%d bytes)",
+                resp.status_code, elapsed_ms, len(resp.content or b""),
+            )
 
             if resp.status_code == 429 or 500 <= resp.status_code < 600:
                 if attempt >= MAX_RETRIES:
@@ -85,6 +99,10 @@ class FusionApiClient:
                         f"Repeated {resp.status_code} from {url}", resp.status_code, path
                     )
                 retry_after = resp.headers.get("Retry-After")
+                logger.debug(
+                    "Retrying after %s status %d (Retry-After=%s)",
+                    url, resp.status_code, retry_after,
+                )
                 self._sleep_backoff(attempt, retry_after)
                 continue
 
@@ -144,25 +162,65 @@ class FusionApiClient:
         is a bare list instead (a few endpoints aren't paginated).
         """
         offset = 0
+        page_num = 0
+        total_yielded = 0
+        start_time = time.monotonic()
+
         while True:
+            page_num += 1
+            if page_num > MAX_PAGES_PER_RESOURCE:
+                # Something is wrong: either the server never stops reporting
+                # `partial`, or `next`/`offset` bookkeeping isn't advancing.
+                # Fail loudly rather than paging forever.
+                raise ApiError(
+                    f"Aborting {path}: exceeded {MAX_PAGES_PER_RESOURCE} pages "
+                    f"({total_yielded} items so far) without the server reporting "
+                    "completion. This looks like a pagination loop, not real data — "
+                    "run with --debug to inspect the raw responses.",
+                    path=path,
+                )
+
             params = {"limit": limit, "offset": offset}
             if extra_params:
                 params.update(extra_params)
 
+            page_start = time.monotonic()
             payload = self._get(path, params=params, domain_id=domain_id).json()
+            page_elapsed = time.monotonic() - page_start
 
             if isinstance(payload, list):
                 # Non-paginated endpoint — yield and stop.
+                logger.debug("%s returned a bare list (%d items), not paginated", path, len(payload))
                 for item in payload:
                     yield item
+                    total_yielded += 1
                 return
 
             data = payload.get("data", [])
+            partial = payload.get("partial", False)
+            next_cursor = payload.get("next")
+
+            logger.debug(
+                "%s page %d: offset=%d got=%d partial=%s next=%s (%.0fms)",
+                path, page_num, offset, len(data), partial, next_cursor, page_elapsed * 1000,
+            )
+            if page_num == 1 or page_num % 5 == 0:
+                logger.progress(
+                    "  %s: page %d, %d item(s) so far (%.1fs elapsed)",
+                    path, page_num, total_yielded + len(data), time.monotonic() - start_time,
+                )
+
             for item in data:
                 yield item
+                total_yielded += 1
 
             if not data:
+                logger.debug("%s: empty page, stopping", path)
                 return
-            if not payload.get("partial", False) and payload.get("next") is None:
+            if not partial and next_cursor is None:
+                logger.debug(
+                    "%s: complete after %d page(s), %d item(s), %.1fs",
+                    path, page_num, total_yielded, time.monotonic() - start_time,
+                )
                 return
             offset += limit

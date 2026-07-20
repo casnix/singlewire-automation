@@ -2,14 +2,16 @@
 crawler + both renderers work end-to-end without needing a real Fusion
 instance. Uses canned responses shaped like real API payloads.
 """
+import logging
 import sys
 sys.path.insert(0, ".")
 
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
-from informacast_report.api_client import ApiError, FusionApiClient
+from informacast_report.api_client import ApiError, FusionApiClient, MAX_PAGES_PER_RESOURCE
 from informacast_report.config import Settings
 from informacast_report.crawler import Crawler
+from informacast_report.logging_utils import setup_logging
 from informacast_report.resources import RESOURCES
 
 FAKE_DATA = {
@@ -91,8 +93,96 @@ def main():
     render_docx(report, "/tmp/smoke_report.docx")
     print("DOCX report written to /tmp/smoke_report.docx")
 
-    print("\nSMOKE TEST PASSED")
+    print("\nSMOKE TEST PASSED (basic crawl + render)\n")
+
+
+def test_logging_levels():
+    """Confirm --verbose surfaces per-resource progress lines and --debug
+    additionally surfaces raw HTTP/pagination detail, using the real
+    paged_get pagination logic against a mocked HTTP layer (not a mocked
+    paged_get) so we're actually exercising the pagination code path.
+    """
+    print("=" * 70)
+    print("Testing --verbose output")
+    print("=" * 70)
+    setup_logging(verbose=True, debug=False)
+    _run_two_page_fetch()
+
+    print()
+    print("=" * 70)
+    print("Testing --debug output")
+    print("=" * 70)
+    setup_logging(verbose=False, debug=True)
+    _run_two_page_fetch()
+
+
+def _run_two_page_fetch():
+    """Fetch a resource that spans two pages, using a real mocked HTTP
+    session so pagination, not just the crawler, is exercised.
+    """
+    settings = Settings(token="fake-token", base_url="https://fake.example.com/api/v1", timeout=30)
+    client = FusionApiClient(settings)
+
+    page1 = MagicMock(status_code=200, ok=True, content=b"x" * 500)
+    page1.json.return_value = {
+        "total": 3, "partial": True, "previous": None, "next": "1",
+        "data": [{"id": "a", "name": "A"}, {"id": "b", "name": "B"}],
+    }
+    page2 = MagicMock(status_code=200, ok=True, content=b"x" * 200)
+    page2.json.return_value = {
+        "total": 3, "partial": False, "previous": "0", "next": None,
+        "data": [{"id": "c", "name": "C"}],
+    }
+    client.session.get = MagicMock(side_effect=[page1, page2])
+
+    items = list(client.paged_get("/fake-resource"))
+    assert [i["id"] for i in items] == ["a", "b", "c"], items
+
+
+def test_pagination_loop_guard():
+    """A server that never stops reporting partial=True should be caught by
+    MAX_PAGES_PER_RESOURCE rather than looping forever.
+    """
+    print()
+    print("=" * 70)
+    print("Testing pagination loop guard (should raise ApiError, not hang)")
+    print("=" * 70)
+    setup_logging(verbose=False, debug=False)
+
+    settings = Settings(token="fake-token", base_url="https://fake.example.com/api/v1", timeout=30)
+    client = FusionApiClient(settings)
+
+    def infinite_page(*args, **kwargs):
+        resp = MagicMock(status_code=200, ok=True, content=b"x")
+        resp.json.return_value = {
+            "total": 999999, "partial": True, "previous": None, "next": "1",
+            "data": [{"id": "loop", "name": "Loop"}],
+        }
+        return resp
+
+    client.session.get = MagicMock(side_effect=infinite_page)
+
+    from informacast_report.api_client import MAX_PAGES_PER_RESOURCE as MAXP
+    try:
+        # Use a tiny cap via monkeypatch to keep the test fast.
+        import informacast_report.api_client as api_client_mod
+        original = api_client_mod.MAX_PAGES_PER_RESOURCE
+        api_client_mod.MAX_PAGES_PER_RESOURCE = 5
+        try:
+            list(client.paged_get("/looping-resource"))
+            raise AssertionError("Expected ApiError from loop guard, got no error")
+        except ApiError as exc:
+            print(f"Caught expected ApiError: {exc}")
+        finally:
+            api_client_mod.MAX_PAGES_PER_RESOURCE = original
+    finally:
+        pass
+
+    print("Loop guard test PASSED")
 
 
 if __name__ == "__main__":
     main()
+    test_logging_levels()
+    test_pagination_loop_guard()
+    print("\nALL SMOKE TESTS PASSED")

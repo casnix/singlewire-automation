@@ -62,9 +62,30 @@ python main.py --format pdf --output report.pdf
 # Limit to specific resource groups (comma-separated) instead of everything
 python main.py --format html --groups users,messaging,recipients
 
-# Verbose logging (prints every API call)
-python main.py --format html -v
+# Progress logging: one line per resource fetched, with item counts and
+# timing, plus per-domain start/end. Good for watching a long run.
+python main.py --format html --verbose
+
+# Full trace: everything --verbose shows, plus raw HTTP status/timing per
+# call, retry/backoff decisions, and per-page pagination internals (offset,
+# partial, next). Use this to chase down a suspected loop or logic error.
+python main.py --format html --debug
 ```
+
+### Logging levels at a glance
+
+| Flag | What you see |
+|---|---|
+| *(none)* | Milestones only: crawl start, one line per domain, final summary, output path. |
+| `--verbose` | Adds: one line per resource (path, item count, elapsed time), site-tree/alarm-detail fetch progress, reference-resolution progress, render timing. |
+| `--debug` | Adds: every HTTP GET (URL, params, status, latency, response size), retry/backoff decisions, and per-page pagination detail (offset, `partial`, `next`). |
+
+There's also a built-in pagination **loop guard**: if any single resource
+pages past 2,000 requests without the API reporting completion, the tool
+aborts that resource with a clear error rather than hanging indefinitely —
+a strong signal of either a bug in how a response is being read or an
+unexpected API behavior on that endpoint. `--debug` will show you exactly
+what the last few pages looked like leading up to it.
 
 ## Extending it
 

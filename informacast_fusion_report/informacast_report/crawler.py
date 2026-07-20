@@ -12,6 +12,7 @@ Design notes:
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -19,6 +20,12 @@ from .api_client import ApiError, FusionApiClient
 from .resources import ResourceSpec, RESOURCES
 
 logger = logging.getLogger("informacast_report.crawler")
+
+# If a single resource comes back with more items than this, it's still
+# rendered in full, but we log a warning — on real instances this usually
+# means either a genuinely huge org, or the same page being re-fetched due
+# to a bug elsewhere. Worth a second look either way.
+SUSPICIOUSLY_LARGE_RESULT = 10_000
 
 
 @dataclass
@@ -51,16 +58,22 @@ class Crawler:
     # -- top level ---------------------------------------------------------
 
     def run(self) -> InstanceReport:
+        run_start = time.monotonic()
         report = InstanceReport(base_url=self.client.base_url)
 
         domains = self._safe_list("/domains")
         if not domains:
-            # No Domains feature in use — crawl once with no domain context.
+            logger.info("No Domains in use — crawling instance with default context.")
             report.domains.append(self._crawl_domain(None))
         else:
-            for d in domains:
+            logger.info("Found %d domain(s): %s", len(domains), ", ".join(d.get("name", d.get("id", "?")) for d in domains))
+            for i, d in enumerate(domains, start=1):
+                logger.info("Crawling domain %d/%d: %s", i, len(domains), d.get("name", d.get("id")))
                 report.domains.append(self._crawl_domain(d))
 
+        logger.info(
+            "Crawl complete: %d domain(s) in %.1fs", len(report.domains), time.monotonic() - run_start
+        )
         return report
 
     def _safe_list(self, path: str) -> list[dict]:
@@ -82,17 +95,33 @@ class Crawler:
                 continue
 
             result = ResourceResult(spec=spec)
+            fetch_start = time.monotonic()
             try:
                 fetch_domain_id = domain_id if spec.domain_scoped else None
                 result.items = list(self.client.paged_get(spec.path, domain_id=fetch_domain_id))
+                elapsed = time.monotonic() - fetch_start
+                logger.progress(
+                    "[%s] %s: %d item(s) in %.2fs", spec.group, spec.key, len(result.items), elapsed
+                )
+                if len(result.items) > SUSPICIOUSLY_LARGE_RESULT:
+                    logger.warning(
+                        "%s returned %d items (>%d) — double check this isn't a pagination "
+                        "loop re-yielding the same data; run with --debug to inspect page-by-page.",
+                        spec.key, len(result.items), SUSPICIOUSLY_LARGE_RESULT,
+                    )
             except ApiError as exc:
                 result.error = str(exc)
                 logger.info("Resource %s unavailable: %s", spec.key, exc)
             dr.resources[spec.key] = result
 
+        logger.progress("Fetching site/building/floor/zone tree...")
         dr.sites_tree = self._crawl_sites_tree(dr, domain_id)
+        logger.progress("Site tree: %d site(s)", len(dr.sites_tree))
+
+        logger.progress("Fetching alarm actions/events...")
         dr.alarm_details = self._crawl_alarm_details(dr, domain_id)
 
+        logger.progress("Resolving cross-referenced IDs to names...")
         self._resolve_references(dr)
         return dr
 
@@ -163,6 +192,8 @@ class Crawler:
                 item_id = item.get("id")
                 if item_id and name_field in item:
                     name_index[item_id] = item[name_field] or item_id
+
+        logger.debug("Built name index with %d entries for reference resolution", len(name_index))
 
         for result in dr.resources.values():
             if not result.spec.ref_fields:

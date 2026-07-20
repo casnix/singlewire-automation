@@ -5,17 +5,20 @@ Examples:
     python main.py --format html --output report.html
     python main.py --format docx --output report.docx
     python main.py --format pdf  --output report.pdf
-    python main.py --format html --groups access,messaging -v
+    python main.py --format html --groups access,messaging --verbose
+    python main.py --format html --debug
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import sys
+import time
 
 from informacast_report.api_client import ApiError, FusionApiClient
 from informacast_report.config import ConfigError, Settings
 from informacast_report.crawler import Crawler
+from informacast_report.logging_utils import setup_logging
 from informacast_report.resources import GROUPS, resources_for_groups
 
 
@@ -35,18 +38,26 @@ def parse_args() -> argparse.Namespace:
              f"Available: {', '.join(GROUPS.keys())}. Default: all.",
     )
     parser.add_argument(
-        "-v", "--verbose", action="store_true",
-        help="Verbose logging (prints every API call)",
+        "--verbose", action="store_true",
+        help="Print progress as it works: one line per resource fetched "
+             "(item count, time taken), per-domain start/end, and pagination "
+             "progress on large lists. Good for watching a long run and "
+             "spotting a resource that's unexpectedly slow or huge.",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Everything --verbose shows, plus raw HTTP request/response "
+             "details (status codes, timings, byte sizes), retry/backoff "
+             "decisions, and full pagination internals (offsets, partial/"
+             "next values per page). Use this to track down loops or logic "
+             "errors — it's noisy by design.",
     )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-    )
+    setup_logging(verbose=args.verbose, debug=args.debug)
     log = logging.getLogger("informacast_report")
 
     try:
@@ -70,6 +81,9 @@ def main() -> int:
 
     output_path = args.output or f"report.{args.format}"
 
+    log.progress("Rendering %s report...", args.format)
+    render_start = time.monotonic()
+
     if args.format == "html":
         from informacast_report.render_html import render_html
         html = render_html(report)
@@ -82,6 +96,7 @@ def main() -> int:
         from informacast_report.render_html import render_pdf
         render_pdf(report, output_path)
 
+    log.progress("Render finished in %.2fs", time.monotonic() - render_start)
     log.info("Report written to %s", output_path)
     return 0
 
