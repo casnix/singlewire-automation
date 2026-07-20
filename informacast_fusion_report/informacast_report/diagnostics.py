@@ -64,15 +64,39 @@ def test_resource(client: FusionApiClient, key: str, domain_id_override: Optiona
         pages = stats.get("pages", 0)
         advertised = stats.get("advertised_total")
         envelope = stats.get("envelope", "unknown")
+        truncated = stats.get("truncated", False)
+        duplicates = stats.get("duplicates", 0)
+        raw_items = stats.get("raw_items")
 
         print(f"  Envelope shape:       {envelope}")
         print(f"  Pages fetched:        {pages}")
-        print(f"  Items collected:      {len(items)}")
+        print(f"  Unique items:         {len(items)}")
+        if raw_items is not None and raw_items != len(items):
+            print(f"  Raw items received:   {raw_items} ({duplicates} duplicate(s) filtered out)")
         print(
             "  API-advertised total: "
             + (str(advertised) if advertised is not None else "n/a (endpoint has no total field)")
         )
         print(f"  Time taken:           {elapsed:.2f}s")
+
+        if duplicates:
+            print(
+                f"  ⚠ NOTE: {duplicates} duplicate item(s) were seen across pages and "
+                "filtered out. This endpoint may not be honoring the offset parameter "
+                "reliably — re-run with --debug to see exactly which pages overlapped. "
+                "If a page ever returns the *exact same* items as the one before it, "
+                "this will raise an error instead (pagination is stuck, not just "
+                "overlapping)."
+            )
+
+        if truncated:
+            print(
+                "  ⚠ NOTE: a page had to be truncated to match the advertised total — "
+                "this endpoint's partial/next flags claimed more data was available "
+                "past its own declared total. Re-run with --debug to see exactly which "
+                "page and how much was cut. Data collected is still correct (capped at "
+                "the real total), just flagging that this endpoint's flags aren't reliable."
+            )
 
         if advertised is not None and len(items) != advertised:
             print(

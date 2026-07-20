@@ -276,10 +276,175 @@ def test_diagnostic_mode():
     print("Diagnostic mode test PASSED")
 
 
+def test_total_overshoot_bug():
+    """Regression test for the bug reported this time: an endpoint that
+    always claims partial=True (and always returns a full page) no matter
+    how far past its own declared `total` you go — exactly the pasted log
+    (total=448 but still fetching full pages at offset=9000). The OLD OR-
+    based logic would keep going because partial/full-page always won. The
+    FIXED logic must treat `total` as a hard ceiling: stop (truncating the
+    final page if needed) the moment total_yielded reaches it, regardless
+    of what partial/next claim.
+    """
+    print()
+    print("=" * 70)
+    print("Testing pagination OVERSHOOTING total (this session's reported bug)")
+    print("=" * 70)
+    setup_logging(verbose=False, debug=False)
+
+    settings = Settings(token="fake-token", base_url="https://fake.example.com/api/v1", timeout=30)
+    client = FusionApiClient(settings)
+
+    TOTAL = 448
+    LIMIT = 100
+    call_count = {"n": 0}
+
+    def always_full_page(url, params=None, headers=None, timeout=None):
+        # Server ALWAYS returns a full 100-item page and ALWAYS claims
+        # partial=True / next=<something>, no matter the offset -- it does
+        # not actually respect offset for real data past a point, it just
+        # keeps manufacturing full pages. This is what caused the runaway
+        # in the pasted log (still full pages at offset=9000, total=448).
+        call_count["n"] += 1
+        offset = params["offset"]
+        data = [{"id": f"u{offset + i}", "name": f"User {offset + i}"} for i in range(LIMIT)]
+        resp = MagicMock(status_code=200, ok=True, content=b"x" * 100)
+        resp.json.return_value = {
+            "total": TOTAL,
+            "partial": True,     # <-- always true, forever, regardless of offset
+            "previous": None,
+            "next": str(offset + LIMIT),  # <-- always advances, never null
+            "data": data,
+        }
+        return resp
+
+    client.session.get = MagicMock(side_effect=always_full_page)
+
+    stats = {}
+    items = list(client.paged_get("/users", limit=LIMIT, stats=stats))
+
+    print(f"  Server: always full pages, always partial=True, total={TOTAL}")
+    print(f"  HTTP calls made: {call_count['n']}")
+    print(f"  Items collected: {len(items)}  (pages: {stats.get('pages')})")
+    print(f"  Truncated:       {stats.get('truncated')}")
+
+    assert call_count["n"] == 5, (
+        f"BUG STILL PRESENT: made {call_count['n']} HTTP calls instead of the expected 5 "
+        f"(ceil(448/100)) — pagination is overshooting total again, same as the pasted log "
+        f"running past offset=9000."
+    )
+    assert len(items) == TOTAL, f"Expected exactly {TOTAL} items, got {len(items)}"
+    assert stats.get("truncated") is True, "Expected the final page to be flagged as truncated"
+    # Confirm no duplicate/fabricated ids beyond the real total leaked through.
+    assert items[-1]["id"] == f"u{TOTAL - 1}", f"Unexpected last item: {items[-1]}"
+
+    print("  ✓ Stopped at exactly 5 pages / 448 items instead of running past total.")
+    print("Total-overshoot regression test PASSED")
+
+
+def test_stuck_page_repeat_bug():
+    """Regression test for the bug reported this round: an endpoint that
+    ignores `offset` entirely and just keeps re-serving page 1, forever.
+    Same root cause as the device-groups cursor bug, but for offset-based
+    pagination. Must raise immediately (not wait for MAX_PAGES) since the
+    exact same ids repeating is an unambiguous signal.
+    """
+    print()
+    print("=" * 70)
+    print("Testing STUCK pagination: server ignores offset, always returns page 1")
+    print("=" * 70)
+    setup_logging(verbose=False, debug=False)
+
+    settings = Settings(token="fake-token", base_url="https://fake.example.com/api/v1", timeout=30)
+    client = FusionApiClient(settings)
+
+    call_count = {"n": 0}
+
+    def always_page_one(url, params=None, headers=None, timeout=None):
+        call_count["n"] += 1
+        resp = MagicMock(status_code=200, ok=True, content=b"x" * 100)
+        resp.json.return_value = {
+            "total": 448,  # server claims a large total...
+            "partial": True,
+            "previous": None,
+            "next": "100",
+            # ...but always returns the exact same 100 ids regardless of offset.
+            "data": [{"id": f"u{i}", "name": f"User {i}"} for i in range(100)],
+        }
+        return resp
+
+    client.session.get = MagicMock(side_effect=always_page_one)
+
+    try:
+        list(client.paged_get("/users"))
+        raise AssertionError("Expected ApiError for stuck pagination, got none")
+    except ApiError as exc:
+        print(f"  Caught expected ApiError after {call_count['n']} call(s): {exc}")
+        assert call_count["n"] == 2, (
+            f"Expected exactly 2 HTTP calls (page 1, then page 2 detected as an exact "
+            f"repeat) before aborting, got {call_count['n']} — it kept going instead of "
+            f"failing fast."
+        )
+        assert "exact same" in str(exc) and "stuck" in str(exc)
+
+    print("Stuck-page regression test PASSED")
+
+
+def test_partial_duplicate_overlap():
+    """A page that partially overlaps with previously-seen ids (rather than
+    being an exact repeat) should be filtered/de-duplicated and logged as a
+    warning, not silently accepted and not treated as fatal.
+    """
+    print()
+    print("=" * 70)
+    print("Testing PARTIAL duplicate overlap across pages (warn + dedupe, not fatal)")
+    print("=" * 70)
+    setup_logging(verbose=False, debug=False)
+
+    settings = Settings(token="fake-token", base_url="https://fake.example.com/api/v1", timeout=30)
+    client = FusionApiClient(settings)
+
+    # Page 1: users 0-4. Page 2: overlaps on users 3-4, then adds 5-7 (new).
+    # Page 3: empty -> stop. No `total` field at all on this endpoint.
+    pages = [
+        {"partial": True, "next": "1", "data": [{"id": f"u{i}"} for i in range(0, 5)]},
+        {"partial": True, "next": "2", "data": [{"id": f"u{i}"} for i in range(3, 8)]},
+        {"partial": False, "next": None, "data": []},
+    ]
+    call = {"n": 0}
+
+    def router(url, params=None, headers=None, timeout=None):
+        idx = min(call["n"], len(pages) - 1)
+        call["n"] += 1
+        resp = MagicMock(status_code=200, ok=True, content=b"x" * 50)
+        resp.json.return_value = pages[idx]
+        return resp
+
+    client.session.get = MagicMock(side_effect=router)
+
+    stats = {}
+    items = list(client.paged_get("/users", limit=5, stats=stats))
+    ids = [i["id"] for i in items]
+
+    print(f"  Collected ids: {ids}")
+    print(f"  Stats: {stats}")
+
+    assert ids == [f"u{i}" for i in range(8)], f"Expected u0..u7 with no dupes, got {ids}"
+    assert stats.get("duplicates") == 2, f"Expected 2 duplicates filtered (u3, u4 reappearing), got {stats.get('duplicates')}"
+    assert stats.get("raw_items") == 10, f"Expected 10 raw items received (5+5), got {stats.get('raw_items')}"
+    assert stats.get("items") == 8, f"Expected 8 unique items, got {stats.get('items')}"
+
+    print("  ✓ Duplicates correctly filtered, unique count and raw count both correct.")
+    print("Partial-overlap regression test PASSED")
+
+
 if __name__ == "__main__":
     main()
     test_logging_levels()
     test_pagination_loop_guard()
     test_unreliable_partial_next_flags()
+    test_total_overshoot_bug()
+    test_stuck_page_repeat_bug()
+    test_partial_duplicate_overlap()
     test_diagnostic_mode()
     print("\nALL SMOKE TESTS PASSED")

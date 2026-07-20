@@ -112,7 +112,7 @@ Path: /users   domain_scoped: True
 -- Domain: (no domain / instance-level) --
   Envelope shape:       paginated
   Pages fetched:        3
-  Items collected:      250
+  Unique items:         250
   API-advertised total: 250
   Time taken:           1.42s
   ✓ Item count matches the API's advertised total.
@@ -127,27 +127,58 @@ for the full per-page trace. The exit code is non-zero if any tested
 resource errored or mismatched, so `--test` is also usable as a quick
 CI-style sanity check.
 
-### The pagination bug this replaced
+### The pagination bugs this replaced
 
-Earlier versions of this tool decided when to stop paging **solely** based
-on the response envelope's `partial`/`next` fields (`{total, partial,
-previous, next, data}`). That's fragile: if a given endpoint doesn't set
-those fields reliably — which happens in practice, even against documented
-APIs — the loop would quietly stop after the first page and silently
-truncate results, with no error or warning.
+This tool's pagination has been fixed three times now — worth documenting
+all three, since each one looks similar on the surface but has a different
+root cause and a different fix.
 
-The fix cross-checks three independent signals and keeps paging if *any* of
-them suggests there's more data:
-1. The documented `partial`/`next` fields, as before.
-2. Whether a **full page** came back (`len(data) == limit`) — a short or
-   empty page is the only truly reliable "this was the last page" signal
-   for classic offset-based pagination.
-3. The envelope's `total` field, if present, compared against how many
-   items have been collected so far.
+**Bug 1 — stopping too early.** The original logic decided when to stop
+paging *solely* based on the response envelope's `partial`/`next` fields. If
+an endpoint didn't set those reliably, the loop would quietly stop after the
+first page and silently truncate results, with no error or warning.
 
-It also now warns explicitly if the final item count doesn't match the
-API's advertised `total`, so a mismatch is visible even during a normal
-full-report run, not just when using `--test`.
+**Bug 2 — never stopping (overshooting `total`).** The fix for Bug 1 changed
+the stop condition to "keep paging if *any* of `partial`/`next`, a full page,
+or `total` suggests more data" — safe against under-fetching, but it meant an
+endpoint that *always* reports `partial: true` and *always* returns a full
+page (regardless of the real dataset size) would never stop, because those
+two signals kept outvoting `total`. This showed up as pagination still
+fetching full 100-item pages at `offset=9000` when the API had reported
+`total=448` on every single page.
+
+**Bug 3 — duplicate/stuck pages (the same root cause as a separate
+`list_device_groups.py` script's cursor-token bug, but for offset-based
+pagination).** Some endpoints silently ignore the `offset` parameter — or
+don't honor it correctly — and just keep re-serving the same page of data,
+with the *same* `partial`/`next`/`total` values every time, so nothing in
+the envelope flags it. Bug 2's fix alone doesn't catch this: if the repeated
+page's item count keeps pushing the running total upward (even though it's
+the same items over and over), the total-ceiling logic will eventually
+"succeed" with a list full of duplicates and missing everything past
+whichever page is stuck.
+
+**The current logic**, in priority order:
+
+1. **Duplicate/stuck-page detection**, checked first: every item id seen so
+   far is tracked. If a page's ids *exactly* match the previous page's ids,
+   pagination is unambiguously stuck (the offset had zero effect) — this
+   raises immediately rather than waiting for the page cap. If a page only
+   *partially* overlaps with ids already collected, that's logged as a
+   `WARNING` and the duplicate items are filtered out of the result, so
+   callers never see duplicate records; items without an `id` field can't be
+   deduplicated this way and are always treated as new.
+2. **Total-as-ceiling**: once `total` *unique* items have been collected
+   (unique — duplicates from #1 don't count), pagination stops there,
+   truncating the final page if needed, regardless of what `partial`/`next`
+   claim. A truncation event is logged as a `WARNING`.
+3. **No-total fallback**: only when an endpoint reports no `total` at all
+   does the tool fall back to the `partial`/`next`/full-page heuristics.
+
+The `--test <resource>` diagnostic mode (see above) reports pages fetched,
+unique items collected, raw items received, duplicates filtered, the
+advertised total, and whether truncation happened — the fastest way to see
+which of these three failure modes (if any) a given endpoint is hitting.
 
 There's also a built-in pagination **loop guard**: if any single resource
 pages past 2,000 requests without the API reporting completion, the tool

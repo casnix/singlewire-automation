@@ -162,29 +162,58 @@ class FusionApiClient:
         used throughout the Fusion API. Falls back gracefully if a response
         is a bare list instead (a few endpoints aren't paginated).
 
-        IMPORTANT: this does NOT stop purely because `partial` is falsy or
-        `next` is null. Those fields are the documented signal, but trusting
-        them alone is fragile — if an endpoint ever omits them, returns them
-        inconsistently, or names them differently than expected, the loop
-        would silently stop after page 1 and truncate real data. Instead,
-        three independent signals are OR'd together, and paging continues if
-        *any* of them suggests there's more:
+        Three things are cross-checked, because trusting any single one of
+        them has already caused a real production incident:
 
-          1. The envelope's own `partial`/`next` fields say so (as documented).
-          2. A full page came back (`len(data) == limit`) — a short/empty
-             page is the only truly reliable "this was the last page" signal
-             for classic offset pagination.
-          3. The envelope's `total` field, if present, says we haven't
-             collected that many items yet.
+          1. Total-as-ceiling. If the envelope reports a `total`, it is
+             authoritative: once `total` unique items have been collected,
+             pagination stops there — even if `partial`/`next` still claim
+             there's more. If a page would push the running count past
+             `total`, it's truncated to exactly the remaining count and a
+             warning is logged (some endpoints report `partial: true` on
+             every single page regardless of real dataset size — trusting
+             that alone previously caused pagination to keep running for
+             dozens of extra pages past the API's own stated total, e.g.
+             still fetching at offset=9000 when total=448).
+
+          2. Duplicate/stuck-page detection. Some endpoints silently ignore
+             the `offset` parameter (or don't honor it correctly) and just
+             keep re-serving the same page of data — with the *same*
+             `partial`/`next`/`total` fields each time, so nothing in the
+             envelope itself flags it. This is detected directly by
+             tracking every item id seen so far:
+               - If a page's ids exactly match the previous page's ids,
+                 pagination is clearly stuck (the offset had zero effect) —
+                 this raises immediately rather than waiting for the page
+                 cap, since continuing would just burn through hundreds of
+                 identical requests for no new data.
+               - If a page partially overlaps with ids already collected,
+                 that's logged as a warning (the offset may be advancing
+                 unreliably) and the duplicate items are filtered out of
+                 what gets yielded, so callers never see duplicate records.
+             Items without an `id` field can't be deduplicated this way and
+             are always treated as new.
+
+          3. No-total fallback. If an endpoint never reports `total` at
+             all, stopping falls back to the documented `partial`/`next`
+             fields OR a full page having come back (`len(data) == limit`)
+             — a short/empty page is the only reliable "last page" signal
+             when there's no total to check against.
 
         `stats`, if given a dict, is populated with diagnostic info (pages
-        fetched, items yielded, advertised total, envelope shape) — used by
-        the --test diagnostic mode to show exactly what happened.
+        fetched, unique items yielded, raw items received, duplicates
+        filtered, advertised total, envelope shape, whether truncation
+        kicked in) — used by the --test diagnostic mode.
         """
         offset = 0
         page_num = 0
-        total_yielded = 0
+        unique_yielded = 0
+        raw_received = 0
+        duplicates_filtered = 0
         advertised_total: Optional[int] = None
+        truncated = False
+        seen_ids: set = set()
+        prev_page_id_set: frozenset = frozenset()
         start_time = time.monotonic()
 
         while True:
@@ -195,11 +224,10 @@ class FusionApiClient:
                 # Fail loudly rather than paging forever.
                 raise ApiError(
                     f"Aborting {path}: exceeded {MAX_PAGES_PER_RESOURCE} pages "
-                    f"({total_yielded} items so far) without reaching a page that's "
-                    "short of the requested limit (and, if the API reports a total, "
-                    "without reaching it either). This looks like a pagination loop, "
-                    "not real data — run with --test <resource> --debug to inspect "
-                    "the raw per-page responses.",
+                    f"({unique_yielded} unique item(s) so far, "
+                    f"advertised total={advertised_total}) without reaching a stopping "
+                    "point. This looks like a pagination loop, not real data — run with "
+                    "--test <resource> --debug to inspect the raw per-page responses.",
                     path=path,
                 )
 
@@ -216,9 +244,9 @@ class FusionApiClient:
                 logger.debug("%s returned a bare list (%d items), not paginated", path, len(payload))
                 for item in payload:
                     yield item
-                    total_yielded += 1
+                    unique_yielded += 1
                 if stats is not None:
-                    stats.update(pages=1, items=total_yielded, advertised_total=None, envelope="bare-list")
+                    stats.update(pages=1, items=unique_yielded, advertised_total=None, envelope="bare-list")
                 return
 
             data = payload.get("data", [])
@@ -227,49 +255,125 @@ class FusionApiClient:
             total = payload.get("total")
             if total is not None:
                 advertised_total = total
+            raw_received += len(data)
 
-            total_yielded += len(data)
+            # -- duplicate / stuck-page detection ---------------------------
+            page_id_set = frozenset(
+                item["id"] for item in data if item.get("id") is not None
+            )
+
+            if page_id_set and page_id_set == prev_page_id_set:
+                raise ApiError(
+                    f"{path}: page {page_num} (offset={offset}) returned the exact same "
+                    f"{len(page_id_set)} item id(s) as the previous page. Pagination is "
+                    "stuck — this endpoint appears to be ignoring the offset parameter "
+                    "and always returning the same data regardless of offset. Run "
+                    "--test <resource> --debug to confirm before assuming this is real "
+                    "data.",
+                    path=path,
+                )
+
+            overlap = page_id_set & seen_ids
+            if overlap:
+                logger.warning(
+                    "%s: page %d (offset=%d) returned %d item(s) (of %d) already seen on "
+                    "an earlier page. This endpoint may not be honoring the offset "
+                    "parameter reliably — duplicates are being filtered from the result, "
+                    "but real data may be getting skipped or re-fetched. Run "
+                    "--test <resource> --debug for detail.",
+                    path, page_num, offset, len(overlap), len(page_id_set),
+                )
+
+            new_items = []
+            local_seen: set = set()
+            for item in data:
+                item_id = item.get("id")
+                if item_id is not None:
+                    if item_id in seen_ids or item_id in local_seen:
+                        duplicates_filtered += 1
+                        continue
+                    local_seen.add(item_id)
+                new_items.append(item)
+
+            seen_ids |= page_id_set
+            prev_page_id_set = page_id_set
+
+            # -- total-as-ceiling: truncate/stop once the advertised total is reached --
+            page_was_truncated = False
+            if advertised_total is not None:
+                remaining = advertised_total - unique_yielded
+                if remaining <= 0:
+                    logger.debug(
+                        "%s: already have advertised_total=%d unique item(s) — "
+                        "discarding this page's %d new item(s) and stopping.",
+                        path, advertised_total, len(new_items),
+                    )
+                    new_items = []
+                    page_was_truncated = True
+                elif len(new_items) > remaining:
+                    logger.warning(
+                        "%s: page %d returned %d new item(s) at offset=%d, but only %d "
+                        "more were needed to reach the API-advertised total=%d. "
+                        "Truncating and stopping — this endpoint's partial/next flags "
+                        "(partial=%s, next=%s) claimed more data was available past its "
+                        "own declared total, so they aren't being trusted here.",
+                        path, page_num, len(new_items), offset, remaining, advertised_total,
+                        partial, next_cursor,
+                    )
+                    new_items = new_items[:remaining]
+                    truncated = True
+                    page_was_truncated = True
+
+            unique_yielded += len(new_items)
 
             logger.debug(
-                "%s page %d: offset=%d got=%d partial=%s next=%s total=%s (%.0fms)",
-                path, page_num, offset, len(data), partial, next_cursor, total, page_elapsed * 1000,
+                "%s page %d: offset=%d raw=%d new=%d dup_overlap=%d partial=%s next=%s "
+                "total=%s (%.0fms)%s",
+                path, page_num, offset, len(data), len(new_items), len(overlap),
+                partial, next_cursor, total, page_elapsed * 1000,
+                " [truncated to match total]" if page_was_truncated and new_items else "",
             )
             if page_num == 1 or page_num % 5 == 0:
                 logger.progress(
-                    "  %s: page %d, %d item(s) so far (%.1fs elapsed)",
-                    path, page_num, total_yielded, time.monotonic() - start_time,
+                    "  %s: page %d, %d unique item(s) so far (%.1fs elapsed)",
+                    path, page_num, unique_yielded, time.monotonic() - start_time,
                 )
 
-            for item in data:
+            for item in new_items:
                 yield item
 
             if stats is not None:
                 stats.update(
-                    pages=page_num, items=total_yielded,
-                    advertised_total=advertised_total, envelope="paginated",
+                    pages=page_num, items=unique_yielded, raw_items=raw_received,
+                    duplicates=duplicates_filtered, advertised_total=advertised_total,
+                    envelope="paginated", truncated=truncated,
                 )
 
             if not data:
                 logger.debug("%s: empty page, stopping", path)
                 return
 
-            flag_says_more = bool(partial) or (next_cursor is not None)
-            full_page = len(data) == limit
-            total_says_more = advertised_total is not None and total_yielded < advertised_total
-
-            if not (flag_says_more or full_page or total_says_more):
-                logger.debug(
-                    "%s: complete after %d page(s), %d item(s), %.1fs",
-                    path, page_num, total_yielded, time.monotonic() - start_time,
-                )
-                if advertised_total is not None and total_yielded != advertised_total:
-                    logger.warning(
-                        "%s: collected %d item(s) but the API reported total=%d — "
-                        "these don't match. Could be duplicate/changing data between "
-                        "pages, or the total field isn't reliable for this endpoint. "
-                        "Run --test on this resource for a closer look.",
-                        path, total_yielded, advertised_total,
+            if advertised_total is not None:
+                # Total is authoritative once known: stop exactly when reached,
+                # regardless of what partial/next claim.
+                if unique_yielded >= advertised_total:
+                    logger.debug(
+                        "%s: reached advertised total (%d unique items) after %d page(s), %.1fs",
+                        path, unique_yielded, page_num, time.monotonic() - start_time,
                     )
-                return
+                    return
+            else:
+                # No total available on this endpoint at all — fall back to
+                # the documented flags plus the full-page heuristic, since
+                # that's all we have to go on.
+                flag_says_more = bool(partial) or (next_cursor is not None)
+                full_page = len(data) == limit
+                if not (flag_says_more or full_page):
+                    logger.debug(
+                        "%s: complete after %d page(s), %d unique item(s), %.1fs "
+                        "(no total field on this endpoint)",
+                        path, page_num, unique_yielded, time.monotonic() - start_time,
+                    )
+                    return
 
             offset += len(data)
