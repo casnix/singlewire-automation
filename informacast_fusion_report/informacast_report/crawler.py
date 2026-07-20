@@ -114,7 +114,8 @@ class Crawler:
                 fetch_domain_id = domain_id if spec.domain_scoped else None
                 result.items = list(
                     self.client.paged_get(
-                        spec.path, domain_id=fetch_domain_id, stats=result.pagination_stats
+                        spec.path, domain_id=fetch_domain_id, stats=result.pagination_stats,
+                        pagination_style=spec.pagination_style,
                     )
                 )
                 elapsed = time.monotonic() - fetch_start

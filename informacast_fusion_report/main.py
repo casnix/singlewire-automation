@@ -63,6 +63,15 @@ def parse_args() -> argparse.Namespace:
              "instead of testing every domain the token can act in.",
     )
     parser.add_argument(
+        "--pagination-style", choices=["offset", "cursor"], default=None,
+        help="Only used with --test: override the resource's configured pagination "
+             "style for this run — 'offset' sends a computed offset=N each request; "
+             "'cursor' echoes back the previous response's `next` value as a `start` "
+             "param instead of computing anything. Use this to experimentally check "
+             "whether an endpoint showing duplicate/stuck warnings actually wants the "
+             "other style, e.g. `--test users --pagination-style cursor`.",
+    )
+    parser.add_argument(
         "--verbose", action="store_true",
         help="Print progress as it works: one line per resource fetched "
              "(item count, time taken), per-domain start/end, and pagination "
@@ -90,7 +99,7 @@ def main() -> int:
             print(f"\n{group_label} ({group_key}):")
             for spec in RESOURCES:
                 if spec.group == group_key:
-                    print(f"  {spec.key:28s} {spec.path}")
+                    print(f"  {spec.key:28s} {spec.path:35s} [{spec.pagination_style}]")
         return 0
 
     try:
@@ -105,7 +114,11 @@ def main() -> int:
         keys = [k.strip() for k in args.test.split(",") if k.strip()]
         all_ok = True
         for key in keys:
-            ok = test_resource(client, key, domain_id_override=args.domain_id)
+            ok = test_resource(
+                client, key,
+                domain_id_override=args.domain_id,
+                pagination_style_override=args.pagination_style,
+            )
             all_ok = all_ok and ok
         if all_ok:
             print("All tested resources look consistent.")

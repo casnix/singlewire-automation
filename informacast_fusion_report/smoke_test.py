@@ -56,12 +56,12 @@ FAKE_DATA = {
 }
 
 
-def fake_paged_get(self, path, domain_id=None, extra_params=None, limit=100, stats=None):
+def fake_paged_get(self, path, domain_id=None, extra_params=None, limit=100, stats=None, pagination_style="offset"):
     data = FAKE_DATA.get(path)
     if data is None:
         raise ApiError(f"404 Not Found for {path}", 404, path)
     if stats is not None:
-        stats.update(pages=1, items=len(data), advertised_total=len(data), envelope="paginated")
+        stats.update(pages=1, items=len(data), advertised_total=len(data), envelope="paginated", pagination_style=pagination_style)
     yield from data
 
 
@@ -438,6 +438,71 @@ def test_partial_duplicate_overlap():
     print("Partial-overlap regression test PASSED")
 
 
+def test_cursor_style_pagination():
+    """Confirm pagination_style='cursor' actually works end-to-end: no
+    offset param sent, `start` echoes back the prior `next` value, and it
+    correctly stops when `next` goes null -- mirroring the standalone
+    list_device_groups.py fix, but inside the main tool's generic client.
+    """
+    print()
+    print("=" * 70)
+    print("Testing pagination_style='cursor' (device-groups style)")
+    print("=" * 70)
+    setup_logging(verbose=False, debug=False)
+
+    settings = Settings(token="fake-token", base_url="https://fake.example.com/api/v1", timeout=30)
+    client = FusionApiClient(settings)
+
+    pages = [
+        {"total": 5, "next": "tokA", "data": [{"id": "g1"}, {"id": "g2"}]},
+        {"total": 5, "next": "tokB", "data": [{"id": "g3"}, {"id": "g4"}]},
+        {"total": 5, "next": None, "data": [{"id": "g5"}]},
+    ]
+    call_params = []
+
+    def router(url, params=None, headers=None, timeout=None):
+        call_params.append(dict(params))
+        idx = len(call_params) - 1
+        resp = MagicMock(status_code=200, ok=True, content=b"x" * 50)
+        resp.json.return_value = pages[idx]
+        return resp
+
+    client.session.get = MagicMock(side_effect=router)
+
+    items = list(client.paged_get("/device-groups", limit=2, pagination_style="cursor"))
+
+    print(f"  Params sent per call: {call_params}")
+    print(f"  Collected: {[i['id'] for i in items]}")
+
+    assert [i["id"] for i in items] == ["g1", "g2", "g3", "g4", "g5"]
+    # Crucially: no 'offset' key should ever be sent in cursor mode, and
+    # 'start' should be absent on call 1, then exactly the prior 'next'.
+    assert "offset" not in call_params[0]
+    assert "start" not in call_params[0]
+    assert call_params[1]["start"] == "tokA"
+    assert call_params[2]["start"] == "tokB"
+
+    print("  ✓ Cursor-style pagination correctly echoed 'next' back as 'start', no offset sent.")
+    print("Cursor-style pagination test PASSED")
+
+
+def test_device_groups_resource_is_cursor_style():
+    """Guard against silently regressing the device_groups ResourceSpec back
+    to offset-style pagination -- this was the concrete, confirmed fix.
+    """
+    print()
+    print("=" * 70)
+    print("Confirming resources.py: device_groups is configured as cursor-style")
+    print("=" * 70)
+    from informacast_report.resources import get_resource
+    spec = get_resource("device_groups")
+    assert spec.pagination_style == "cursor", (
+        f"device_groups regressed to pagination_style={spec.pagination_style!r} -- "
+        f"this endpoint is confirmed to need cursor-style pagination."
+    )
+    print("  ✓ device_groups is configured as pagination_style='cursor'")
+
+
 if __name__ == "__main__":
     main()
     test_logging_levels()
@@ -446,5 +511,7 @@ if __name__ == "__main__":
     test_total_overshoot_bug()
     test_stuck_page_repeat_bug()
     test_partial_duplicate_overlap()
+    test_cursor_style_pagination()
+    test_device_groups_resource_is_cursor_style()
     test_diagnostic_mode()
     print("\nALL SMOKE TESTS PASSED")

@@ -29,6 +29,7 @@ class ResourceSpec:
     ref_fields: tuple = field(default_factory=tuple)   # fields on items that reference other resources
     domain_scoped: bool = True   # whether this resource is fetched per-domain
     notes: Optional[str] = None  # shown in the report to explain caveats
+    pagination_style: str = "offset"  # "offset" (compute offset=N) or "cursor" (echo back `next` as `start`)
 
 
 GROUPS = {
@@ -85,6 +86,15 @@ RESOURCES: list[ResourceSpec] = [
         label="Device Groups",
         path="/device-groups",
         group="recipients",
+        pagination_style="cursor",
+        notes=(
+            "Confirmed via separate investigation that this endpoint uses cursor-token "
+            "pagination (echoing back `next` as a `start` param) rather than a computed "
+            "offset — passing a computed offset here was silently returning page 1 "
+            "repeatedly. Other resources default to offset-style pagination, which is "
+            "unconfirmed against Singlewire's actual API Explorer; if --test shows "
+            "duplicate/stuck warnings for any of them, try `--pagination-style cursor`."
+        ),
     ),
     ResourceSpec(
         key="collaboration_groups",

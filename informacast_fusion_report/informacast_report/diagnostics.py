@@ -17,10 +17,21 @@ from .crawler import list_domains
 from .resources import ResourceSpec, get_resource
 
 
-def test_resource(client: FusionApiClient, key: str, domain_id_override: Optional[str] = None) -> bool:
+def test_resource(
+    client: FusionApiClient,
+    key: str,
+    domain_id_override: Optional[str] = None,
+    pagination_style_override: Optional[str] = None,
+) -> bool:
     """Run a diagnostic fetch of one resource. Prints a human-readable
     breakdown and returns True if everything checked out, False if a
     mismatch or error was detected (used as the process exit code).
+
+    `pagination_style_override`, if given, overrides the resource's
+    configured pagination_style ("offset" or "cursor") for this run only —
+    use this to experimentally check whether an endpoint actually wants the
+    other style, e.g. `--test users --pagination-style cursor`, without
+    having to edit resources.py first.
     """
     try:
         spec = get_resource(key)
@@ -28,9 +39,13 @@ def test_resource(client: FusionApiClient, key: str, domain_id_override: Optiona
         print(f"✗ {exc}")
         return False
 
+    style = pagination_style_override or spec.pagination_style
+
     print(f"\n{'=' * 70}")
     print(f"Testing resource: {spec.key}  (label: {spec.label!r}, group: {spec.group})")
-    print(f"Path: {spec.path}   domain_scoped: {spec.domain_scoped}")
+    print(f"Path: {spec.path}   domain_scoped: {spec.domain_scoped}   pagination_style: {style}")
+    if pagination_style_override and pagination_style_override != spec.pagination_style:
+        print(f"  (overriding configured style {spec.pagination_style!r} for this run)")
     if spec.notes:
         print(f"Note: {spec.notes}")
     print("=" * 70)
@@ -54,7 +69,9 @@ def test_resource(client: FusionApiClient, key: str, domain_id_override: Optiona
         stats: dict = {}
         start = time.monotonic()
         try:
-            items = list(client.paged_get(spec.path, domain_id=domain_id, stats=stats))
+            items = list(
+                client.paged_get(spec.path, domain_id=domain_id, stats=stats, pagination_style=style)
+            )
         except ApiError as exc:
             print(f"  ✗ ERROR: {exc}")
             ok = False

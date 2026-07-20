@@ -84,6 +84,11 @@ python main.py --test users,message_templates,scenarios --debug
 
 # Restrict a test to one specific Domain ID instead of every domain:
 python main.py --test users --domain-id 159e9330-232a-11e4-8e47-685b358ea847
+
+# Experimentally try the OTHER pagination style for a resource, without
+# editing resources.py first -- useful if --test shows duplicate/stuck
+# warnings under the default style:
+python main.py --test users --pagination-style cursor
 ```
 
 ### Logging levels at a glance
@@ -175,10 +180,38 @@ whichever page is stuck.
 3. **No-total fallback**: only when an endpoint reports no `total` at all
    does the tool fall back to the `partial`/`next`/full-page heuristics.
 
+**Bug 4 — assuming one pagination *mechanism* fits every endpoint.** Bugs 1–3
+above were all about *when to stop* — but a separate, standalone script
+(`list_device_groups.py`) confirmed that `/device-groups` doesn't use
+offset-based pagination at all: it uses cursor-token pagination, where you
+must echo back the previous response's `next` value verbatim as a `start`
+query parameter — a computed offset is silently ignored (you just get page 1
+back, forever, which looks exactly like Bug 3's symptoms). Since this main
+tool's `device_groups` resource entry was using the same offset-based
+`paged_get` as everything else, it very likely had the identical bug.
+
+Rather than picking one mechanism, `paged_get` now takes a `pagination_style`
+argument (`"offset"` or `"cursor"`), and each `ResourceSpec` in `resources.py`
+declares which one it needs. `device_groups` is now set to `"cursor"`,
+confirmed by that separate investigation. Every other resource still
+defaults to `"offset"` — this is **not independently confirmed** against
+Singlewire's real API Explorer (which is JS-rendered and couldn't be
+scraped), just the best available guess. If `--test <resource>` shows
+duplicate-item or stuck-page warnings for anything, try the other style
+before assuming the endpoint itself is broken:
+
+```bash
+python main.py --test users --pagination-style cursor
+```
+
+If that resolves the warnings, update that resource's `pagination_style` in
+`resources.py` to make the fix permanent.
+
 The `--test <resource>` diagnostic mode (see above) reports pages fetched,
 unique items collected, raw items received, duplicates filtered, the
-advertised total, and whether truncation happened — the fastest way to see
-which of these three failure modes (if any) a given endpoint is hitting.
+advertised total, whether truncation happened, and which pagination style
+was used — the fastest way to see which of these four failure modes (if
+any) a given endpoint is hitting.
 
 There's also a built-in pagination **loop guard**: if any single resource
 pages past 2,000 requests without the API reporting completion, the tool

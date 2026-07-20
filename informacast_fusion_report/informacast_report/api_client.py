@@ -155,6 +155,7 @@ class FusionApiClient:
         extra_params: Optional[dict] = None,
         limit: int = DEFAULT_PAGE_LIMIT,
         stats: Optional[dict] = None,
+        pagination_style: str = "offset",
     ) -> Iterator[dict]:
         """Yield every item from a paginated list endpoint.
 
@@ -162,8 +163,25 @@ class FusionApiClient:
         used throughout the Fusion API. Falls back gracefully if a response
         is a bare list instead (a few endpoints aren't paginated).
 
-        Three things are cross-checked, because trusting any single one of
-        them has already caused a real production incident:
+        `pagination_style` controls how the *next page* is requested — this
+        turned out to genuinely vary by endpoint, not just be a guess:
+
+          - "offset" (default): send `offset=<running count>` each request,
+            incrementing by however many items the previous page returned.
+            This matches the numeric-looking `next` values documented for
+            most cloud/mobile-API resources (users, alarms, etc.).
+          - "cursor": don't compute anything — just echo back whatever the
+            previous response's `next` field contained, verbatim, as a
+            `start` query param. Confirmed necessary for `/device-groups`,
+            where passing a computed offset instead is silently ignored by
+            the server (you just get page 1 back, forever). Likely needed
+            for other endpoints too; if `--test <resource>` shows duplicate
+            items or a "stuck" error under "offset" mode, try "cursor" via
+            `--test <resource> --pagination-style cursor` before assuming
+            the endpoint itself is broken.
+
+        Three things are cross-checked regardless of style, because trusting
+        any single one of them has already caused a real production incident:
 
           1. Total-as-ceiling. If the envelope reports a `total`, it is
              authoritative: once `total` unique items have been collected,
@@ -177,20 +195,20 @@ class FusionApiClient:
              still fetching at offset=9000 when total=448).
 
           2. Duplicate/stuck-page detection. Some endpoints silently ignore
-             the `offset` parameter (or don't honor it correctly) and just
-             keep re-serving the same page of data — with the *same*
-             `partial`/`next`/`total` fields each time, so nothing in the
-             envelope itself flags it. This is detected directly by
+             the page-advancement parameter (or don't honor it correctly)
+             and just keep re-serving the same page of data — with the
+             *same* `partial`/`next`/`total` fields each time, so nothing in
+             the envelope itself flags it. This is detected directly by
              tracking every item id seen so far:
                - If a page's ids exactly match the previous page's ids,
-                 pagination is clearly stuck (the offset had zero effect) —
+                 pagination is clearly stuck (advancing had zero effect) —
                  this raises immediately rather than waiting for the page
                  cap, since continuing would just burn through hundreds of
                  identical requests for no new data.
                - If a page partially overlaps with ids already collected,
-                 that's logged as a warning (the offset may be advancing
-                 unreliably) and the duplicate items are filtered out of
-                 what gets yielded, so callers never see duplicate records.
+                 that's logged as a warning and the duplicate items are
+                 filtered out of what gets yielded, so callers never see
+                 duplicate records.
              Items without an `id` field can't be deduplicated this way and
              are always treated as new.
 
@@ -203,9 +221,13 @@ class FusionApiClient:
         `stats`, if given a dict, is populated with diagnostic info (pages
         fetched, unique items yielded, raw items received, duplicates
         filtered, advertised total, envelope shape, whether truncation
-        kicked in) — used by the --test diagnostic mode.
+        kicked in, and the pagination_style used) — used by --test.
         """
+        if pagination_style not in ("offset", "cursor"):
+            raise ValueError(f"Unknown pagination_style {pagination_style!r} (expected 'offset' or 'cursor')")
+
         offset = 0
+        cursor_token: Optional[str] = None
         page_num = 0
         unique_yielded = 0
         raw_received = 0
@@ -220,18 +242,26 @@ class FusionApiClient:
             page_num += 1
             if page_num > MAX_PAGES_PER_RESOURCE:
                 # Something is wrong: either the server never stops reporting
-                # more data, or offset bookkeeping isn't advancing.
-                # Fail loudly rather than paging forever.
+                # more data, or the page-advancement parameter isn't having
+                # any effect. Fail loudly rather than paging forever.
                 raise ApiError(
                     f"Aborting {path}: exceeded {MAX_PAGES_PER_RESOURCE} pages "
                     f"({unique_yielded} unique item(s) so far, "
-                    f"advertised total={advertised_total}) without reaching a stopping "
+                    f"advertised total={advertised_total}, "
+                    f"pagination_style={pagination_style!r}) without reaching a stopping "
                     "point. This looks like a pagination loop, not real data — run with "
                     "--test <resource> --debug to inspect the raw per-page responses.",
                     path=path,
                 )
 
-            params = {"limit": limit, "offset": offset}
+            params = {"limit": limit}
+            if pagination_style == "offset":
+                params["offset"] = offset
+                page_position_desc = f"offset={offset}"
+            else:  # cursor
+                if cursor_token is not None:
+                    params["start"] = cursor_token
+                page_position_desc = f"start={cursor_token!r}"
             if extra_params:
                 params.update(extra_params)
 
@@ -264,24 +294,26 @@ class FusionApiClient:
 
             if page_id_set and page_id_set == prev_page_id_set:
                 raise ApiError(
-                    f"{path}: page {page_num} (offset={offset}) returned the exact same "
-                    f"{len(page_id_set)} item id(s) as the previous page. Pagination is "
-                    "stuck — this endpoint appears to be ignoring the offset parameter "
-                    "and always returning the same data regardless of offset. Run "
-                    "--test <resource> --debug to confirm before assuming this is real "
-                    "data.",
+                    f"{path}: page {page_num} ({page_position_desc}) returned the exact "
+                    f"same {len(page_id_set)} item id(s) as the previous page. Pagination "
+                    f"is stuck — this endpoint appears to be ignoring the page-advancement "
+                    f"parameter ({pagination_style!r} style) and always returning the same "
+                    "data. If this is 'offset' style, try `--pagination-style cursor` with "
+                    "--test to see if this endpoint actually wants a cursor token instead — "
+                    "confirmed necessary for /device-groups, plausibly true here too.",
                     path=path,
                 )
 
             overlap = page_id_set & seen_ids
             if overlap:
                 logger.warning(
-                    "%s: page %d (offset=%d) returned %d item(s) (of %d) already seen on "
-                    "an earlier page. This endpoint may not be honoring the offset "
-                    "parameter reliably — duplicates are being filtered from the result, "
-                    "but real data may be getting skipped or re-fetched. Run "
-                    "--test <resource> --debug for detail.",
-                    path, page_num, offset, len(overlap), len(page_id_set),
+                    "%s: page %d (%s) returned %d item(s) (of %d) already seen on "
+                    "an earlier page. This endpoint may not be honoring '%s'-style "
+                    "pagination reliably — duplicates are being filtered from the result, "
+                    "but real data may be getting skipped or re-fetched. Try "
+                    "`--test <resource> --pagination-style %s` to compare.",
+                    path, page_num, page_position_desc, len(overlap), len(page_id_set),
+                    pagination_style, "cursor" if pagination_style == "offset" else "offset",
                 )
 
             new_items = []
@@ -312,13 +344,13 @@ class FusionApiClient:
                     page_was_truncated = True
                 elif len(new_items) > remaining:
                     logger.warning(
-                        "%s: page %d returned %d new item(s) at offset=%d, but only %d "
+                        "%s: page %d returned %d new item(s) at %s, but only %d "
                         "more were needed to reach the API-advertised total=%d. "
                         "Truncating and stopping — this endpoint's partial/next flags "
                         "(partial=%s, next=%s) claimed more data was available past its "
                         "own declared total, so they aren't being trusted here.",
-                        path, page_num, len(new_items), offset, remaining, advertised_total,
-                        partial, next_cursor,
+                        path, page_num, len(new_items), page_position_desc, remaining,
+                        advertised_total, partial, next_cursor,
                     )
                     new_items = new_items[:remaining]
                     truncated = True
@@ -327,9 +359,9 @@ class FusionApiClient:
             unique_yielded += len(new_items)
 
             logger.debug(
-                "%s page %d: offset=%d raw=%d new=%d dup_overlap=%d partial=%s next=%s "
+                "%s page %d: %s raw=%d new=%d dup_overlap=%d partial=%s next=%s "
                 "total=%s (%.0fms)%s",
-                path, page_num, offset, len(data), len(new_items), len(overlap),
+                path, page_num, page_position_desc, len(data), len(new_items), len(overlap),
                 partial, next_cursor, total, page_elapsed * 1000,
                 " [truncated to match total]" if page_was_truncated and new_items else "",
             )
@@ -346,7 +378,7 @@ class FusionApiClient:
                 stats.update(
                     pages=page_num, items=unique_yielded, raw_items=raw_received,
                     duplicates=duplicates_filtered, advertised_total=advertised_total,
-                    envelope="paginated", truncated=truncated,
+                    envelope="paginated", truncated=truncated, pagination_style=pagination_style,
                 )
 
             if not data:
@@ -376,4 +408,7 @@ class FusionApiClient:
                     )
                     return
 
-            offset += len(data)
+            if pagination_style == "offset":
+                offset += len(data)
+            else:  # cursor
+                cursor_token = next_cursor
