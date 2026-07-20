@@ -154,29 +154,52 @@ class FusionApiClient:
         domain_id: Optional[str] = None,
         extra_params: Optional[dict] = None,
         limit: int = DEFAULT_PAGE_LIMIT,
+        stats: Optional[dict] = None,
     ) -> Iterator[dict]:
         """Yield every item from a paginated list endpoint.
 
         Handles the standard {total, partial, previous, next, data} envelope
         used throughout the Fusion API. Falls back gracefully if a response
         is a bare list instead (a few endpoints aren't paginated).
+
+        IMPORTANT: this does NOT stop purely because `partial` is falsy or
+        `next` is null. Those fields are the documented signal, but trusting
+        them alone is fragile — if an endpoint ever omits them, returns them
+        inconsistently, or names them differently than expected, the loop
+        would silently stop after page 1 and truncate real data. Instead,
+        three independent signals are OR'd together, and paging continues if
+        *any* of them suggests there's more:
+
+          1. The envelope's own `partial`/`next` fields say so (as documented).
+          2. A full page came back (`len(data) == limit`) — a short/empty
+             page is the only truly reliable "this was the last page" signal
+             for classic offset pagination.
+          3. The envelope's `total` field, if present, says we haven't
+             collected that many items yet.
+
+        `stats`, if given a dict, is populated with diagnostic info (pages
+        fetched, items yielded, advertised total, envelope shape) — used by
+        the --test diagnostic mode to show exactly what happened.
         """
         offset = 0
         page_num = 0
         total_yielded = 0
+        advertised_total: Optional[int] = None
         start_time = time.monotonic()
 
         while True:
             page_num += 1
             if page_num > MAX_PAGES_PER_RESOURCE:
                 # Something is wrong: either the server never stops reporting
-                # `partial`, or `next`/`offset` bookkeeping isn't advancing.
+                # more data, or offset bookkeeping isn't advancing.
                 # Fail loudly rather than paging forever.
                 raise ApiError(
                     f"Aborting {path}: exceeded {MAX_PAGES_PER_RESOURCE} pages "
-                    f"({total_yielded} items so far) without the server reporting "
-                    "completion. This looks like a pagination loop, not real data — "
-                    "run with --debug to inspect the raw responses.",
+                    f"({total_yielded} items so far) without reaching a page that's "
+                    "short of the requested limit (and, if the API reports a total, "
+                    "without reaching it either). This looks like a pagination loop, "
+                    "not real data — run with --test <resource> --debug to inspect "
+                    "the raw per-page responses.",
                     path=path,
                 )
 
@@ -194,33 +217,59 @@ class FusionApiClient:
                 for item in payload:
                     yield item
                     total_yielded += 1
+                if stats is not None:
+                    stats.update(pages=1, items=total_yielded, advertised_total=None, envelope="bare-list")
                 return
 
             data = payload.get("data", [])
             partial = payload.get("partial", False)
             next_cursor = payload.get("next")
+            total = payload.get("total")
+            if total is not None:
+                advertised_total = total
+
+            total_yielded += len(data)
 
             logger.debug(
-                "%s page %d: offset=%d got=%d partial=%s next=%s (%.0fms)",
-                path, page_num, offset, len(data), partial, next_cursor, page_elapsed * 1000,
+                "%s page %d: offset=%d got=%d partial=%s next=%s total=%s (%.0fms)",
+                path, page_num, offset, len(data), partial, next_cursor, total, page_elapsed * 1000,
             )
             if page_num == 1 or page_num % 5 == 0:
                 logger.progress(
                     "  %s: page %d, %d item(s) so far (%.1fs elapsed)",
-                    path, page_num, total_yielded + len(data), time.monotonic() - start_time,
+                    path, page_num, total_yielded, time.monotonic() - start_time,
                 )
 
             for item in data:
                 yield item
-                total_yielded += 1
+
+            if stats is not None:
+                stats.update(
+                    pages=page_num, items=total_yielded,
+                    advertised_total=advertised_total, envelope="paginated",
+                )
 
             if not data:
                 logger.debug("%s: empty page, stopping", path)
                 return
-            if not partial and next_cursor is None:
+
+            flag_says_more = bool(partial) or (next_cursor is not None)
+            full_page = len(data) == limit
+            total_says_more = advertised_total is not None and total_yielded < advertised_total
+
+            if not (flag_says_more or full_page or total_says_more):
                 logger.debug(
                     "%s: complete after %d page(s), %d item(s), %.1fs",
                     path, page_num, total_yielded, time.monotonic() - start_time,
                 )
+                if advertised_total is not None and total_yielded != advertised_total:
+                    logger.warning(
+                        "%s: collected %d item(s) but the API reported total=%d — "
+                        "these don't match. Could be duplicate/changing data between "
+                        "pages, or the total field isn't reliable for this endpoint. "
+                        "Run --test on this resource for a closer look.",
+                        path, total_yielded, advertised_total,
+                    )
                 return
-            offset += limit
+
+            offset += len(data)

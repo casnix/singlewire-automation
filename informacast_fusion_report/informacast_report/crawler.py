@@ -28,11 +28,25 @@ logger = logging.getLogger("informacast_report.crawler")
 SUSPICIOUSLY_LARGE_RESULT = 10_000
 
 
+def list_domains(client: FusionApiClient) -> list[dict]:
+    """List every Domain the current token's user can act in. Returns an
+    empty list (not an error) if the instance doesn't use Domains at all.
+    Shared between the full crawl and the --test diagnostic mode so both
+    behave identically with respect to multi-domain instances.
+    """
+    try:
+        return list(client.paged_get("/domains"))
+    except ApiError as exc:
+        logger.info("Could not list /domains (%s) — treating as unused.", exc)
+        return []
+
+
 @dataclass
 class ResourceResult:
     spec: ResourceSpec
     items: list[dict] = field(default_factory=list)
     error: Optional[str] = None
+    pagination_stats: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -61,7 +75,7 @@ class Crawler:
         run_start = time.monotonic()
         report = InstanceReport(base_url=self.client.base_url)
 
-        domains = self._safe_list("/domains")
+        domains = list_domains(self.client)
         if not domains:
             logger.info("No Domains in use — crawling instance with default context.")
             report.domains.append(self._crawl_domain(None))
@@ -98,7 +112,11 @@ class Crawler:
             fetch_start = time.monotonic()
             try:
                 fetch_domain_id = domain_id if spec.domain_scoped else None
-                result.items = list(self.client.paged_get(spec.path, domain_id=fetch_domain_id))
+                result.items = list(
+                    self.client.paged_get(
+                        spec.path, domain_id=fetch_domain_id, stats=result.pagination_stats
+                    )
+                )
                 elapsed = time.monotonic() - fetch_start
                 logger.progress(
                     "[%s] %s: %d item(s) in %.2fs", spec.group, spec.key, len(result.items), elapsed

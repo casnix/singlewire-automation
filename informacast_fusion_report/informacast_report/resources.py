@@ -297,7 +297,20 @@ RESOURCES: list[ResourceSpec] = [
 ]
 
 
+RESOURCE_BY_KEY: dict[str, ResourceSpec] = {r.key: r for r in RESOURCES}
+
+
 def resources_for_groups(selected_groups: Optional[set] = None) -> list[ResourceSpec]:
     if not selected_groups:
         return RESOURCES
     return [r for r in RESOURCES if r.group in selected_groups]
+
+
+def get_resource(key: str) -> ResourceSpec:
+    """Look up a ResourceSpec by its key, raising a helpful error listing
+    valid keys if it doesn't exist (used by the --test CLI option)."""
+    try:
+        return RESOURCE_BY_KEY[key]
+    except KeyError:
+        valid = ", ".join(sorted(RESOURCE_BY_KEY.keys()))
+        raise KeyError(f"Unknown resource key {key!r}. Valid keys: {valid}")

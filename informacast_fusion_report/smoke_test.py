@@ -56,10 +56,12 @@ FAKE_DATA = {
 }
 
 
-def fake_paged_get(self, path, domain_id=None, extra_params=None, limit=100):
+def fake_paged_get(self, path, domain_id=None, extra_params=None, limit=100, stats=None):
     data = FAKE_DATA.get(path)
     if data is None:
         raise ApiError(f"404 Not Found for {path}", 404, path)
+    if stats is not None:
+        stats.update(pages=1, items=len(data), advertised_total=len(data), envelope="paginated")
     yield from data
 
 
@@ -162,9 +164,7 @@ def test_pagination_loop_guard():
 
     client.session.get = MagicMock(side_effect=infinite_page)
 
-    from informacast_report.api_client import MAX_PAGES_PER_RESOURCE as MAXP
     try:
-        # Use a tiny cap via monkeypatch to keep the test fast.
         import informacast_report.api_client as api_client_mod
         original = api_client_mod.MAX_PAGES_PER_RESOURCE
         api_client_mod.MAX_PAGES_PER_RESOURCE = 5
@@ -181,8 +181,105 @@ def test_pagination_loop_guard():
     print("Loop guard test PASSED")
 
 
+def test_unreliable_partial_next_flags():
+    """Regression test for the reported bug: an endpoint that returns full
+    pages of data but never sets `partial`/`next` correctly (e.g. always
+    partial=False, next=None, even when more data exists). The OLD logic
+    would stop after page 1 and silently truncate. The FIXED logic must
+    keep paging because a full page came back, and additionally cross-check
+    against `total`.
+    """
+    print()
+    print("=" * 70)
+    print("Testing pagination with UNRELIABLE partial/next flags (the reported bug)")
+    print("=" * 70)
+    setup_logging(verbose=False, debug=False)
+
+    settings = Settings(token="fake-token", base_url="https://fake.example.com/api/v1", timeout=30)
+    client = FusionApiClient(settings)
+
+    # 250 total users, page size 100, server ALWAYS reports partial=False
+    # and next=None regardless of whether more data remains -- exactly the
+    # kind of unreliable envelope that caused silent truncation before.
+    all_users = [{"id": f"u{i}", "name": f"User {i}"} for i in range(250)]
+
+    def broken_envelope_page(url, params=None, headers=None, timeout=None):
+        offset = params["offset"]
+        limit = params["limit"]
+        page_data = all_users[offset: offset + limit]
+        resp = MagicMock(status_code=200, ok=True, content=b"x" * 100)
+        resp.json.return_value = {
+            "total": len(all_users),
+            "partial": False,   # <-- always False, even mid-pagination (buggy server)
+            "previous": None,
+            "next": None,        # <-- always None, even mid-pagination (buggy server)
+            "data": page_data,
+        }
+        return resp
+
+    client.session.get = MagicMock(side_effect=broken_envelope_page)
+
+    stats = {}
+    items = list(client.paged_get("/users", limit=100, stats=stats))
+
+    print(f"  Requested: 250 users across a server that never sets partial/next correctly")
+    print(f"  Collected: {len(items)} items in {stats.get('pages')} page(s)")
+
+    assert len(items) == 250, (
+        f"BUG STILL PRESENT: only collected {len(items)}/250 items — pagination "
+        f"stopped early because it trusted partial/next alone."
+    )
+    assert stats.get("pages") == 3, f"Expected 3 pages (100+100+50), got {stats.get('pages')}"
+    assert [i["id"] for i in items] == [f"u{i}" for i in range(250)], "Items out of order or missing"
+
+    print("  ✓ All 250 items collected across 3 pages despite unreliable partial/next flags.")
+    print("Unreliable-envelope regression test PASSED")
+
+
+def test_diagnostic_mode():
+    """Exercise the --test resource diagnostic path directly."""
+    print()
+    print("=" * 70)
+    print("Testing --test diagnostic mode against a mocked instance")
+    print("=" * 70)
+
+    from informacast_report.diagnostics import test_resource
+
+    settings = Settings(token="fake-token", base_url="https://fake.example.com/api/v1", timeout=30)
+    client = FusionApiClient(settings)
+
+    call_log = []
+
+    def router(url, params=None, headers=None, timeout=None):
+        call_log.append(url)
+        resp = MagicMock(status_code=200, ok=True, content=b"x" * 50)
+        if url.endswith("/domains"):
+            resp.json.return_value = []  # no domains in use
+        elif url.endswith("/users"):
+            offset = params["offset"]
+            data = [{"id": "u1", "name": "Jane"}, {"id": "u2", "name": "Bob"}][offset: offset + params["limit"]]
+            resp.json.return_value = {"total": 2, "partial": False, "next": None, "data": data}
+        else:
+            resp.status_code = 404
+            resp.ok = False
+        return resp
+
+    client.session.get = MagicMock(side_effect=router)
+
+    ok = test_resource(client, "users")
+    assert ok is True, "Expected test_resource to report success for consistent data"
+
+    # Also confirm an unknown key is handled gracefully rather than raising.
+    ok_unknown = test_resource(client, "not_a_real_resource")
+    assert ok_unknown is False
+
+    print("Diagnostic mode test PASSED")
+
+
 if __name__ == "__main__":
     main()
     test_logging_levels()
     test_pagination_loop_guard()
+    test_unreliable_partial_next_flags()
+    test_diagnostic_mode()
     print("\nALL SMOKE TESTS PASSED")

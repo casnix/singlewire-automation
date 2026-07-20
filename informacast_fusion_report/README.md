@@ -70,6 +70,20 @@ python main.py --format html --verbose
 # call, retry/backoff decisions, and per-page pagination internals (offset,
 # partial, next). Use this to chase down a suspected loop or logic error.
 python main.py --format html --debug
+
+# See every resource key available (for --test / --groups)
+python main.py --list-resources
+
+# Test one specific resource/area in isolation -- no report is generated.
+# Prints pages fetched, items collected, and the API's advertised total,
+# and flags a clear MISMATCH if pagination didn't actually get everything.
+python main.py --test users
+
+# Test more than one at once, with full HTTP tracing:
+python main.py --test users,message_templates,scenarios --debug
+
+# Restrict a test to one specific Domain ID instead of every domain:
+python main.py --test users --domain-id 159e9330-232a-11e4-8e47-685b358ea847
 ```
 
 ### Logging levels at a glance
@@ -78,7 +92,62 @@ python main.py --format html --debug
 |---|---|
 | *(none)* | Milestones only: crawl start, one line per domain, final summary, output path. |
 | `--verbose` | Adds: one line per resource (path, item count, elapsed time), site-tree/alarm-detail fetch progress, reference-resolution progress, render timing. |
-| `--debug` | Adds: every HTTP GET (URL, params, status, latency, response size), retry/backoff decisions, and per-page pagination detail (offset, `partial`, `next`). |
+| `--debug` | Adds: every HTTP GET (URL, params, status, latency, response size), retry/backoff decisions, and per-page pagination detail (offset, `partial`, `next`, `total`). |
+
+### Testing a specific resource (`--test`)
+
+If you suspect a specific area isn't coming through completely — e.g. "I
+think Users isn't paginating" — `--test` fetches just that one resource,
+across every domain, and prints exactly what happened instead of making you
+dig through a full crawl or report:
+
+```
+$ python main.py --test users
+
+======================================================================
+Testing resource: users  (label: 'Users', group: access)
+Path: /users   domain_scoped: True
+======================================================================
+
+-- Domain: (no domain / instance-level) --
+  Envelope shape:       paginated
+  Pages fetched:        3
+  Items collected:      250
+  API-advertised total: 250
+  Time taken:           1.42s
+  ✓ Item count matches the API's advertised total.
+  Sample item fields:   ['id', 'name', 'email', 'isLocked', ...]
+  First item:           {'id': 'u1', ...}
+  Last item:            {'id': 'u250', ...}
+```
+
+If pagination stops early, this prints a `⚠ MISMATCH` line telling you the
+collected count vs. the API's advertised total, and points you at `--debug`
+for the full per-page trace. The exit code is non-zero if any tested
+resource errored or mismatched, so `--test` is also usable as a quick
+CI-style sanity check.
+
+### The pagination bug this replaced
+
+Earlier versions of this tool decided when to stop paging **solely** based
+on the response envelope's `partial`/`next` fields (`{total, partial,
+previous, next, data}`). That's fragile: if a given endpoint doesn't set
+those fields reliably — which happens in practice, even against documented
+APIs — the loop would quietly stop after the first page and silently
+truncate results, with no error or warning.
+
+The fix cross-checks three independent signals and keeps paging if *any* of
+them suggests there's more data:
+1. The documented `partial`/`next` fields, as before.
+2. Whether a **full page** came back (`len(data) == limit`) — a short or
+   empty page is the only truly reliable "this was the last page" signal
+   for classic offset-based pagination.
+3. The envelope's `total` field, if present, compared against how many
+   items have been collected so far.
+
+It also now warns explicitly if the final item count doesn't match the
+API's advertised `total`, so a mismatch is visible even during a normal
+full-report run, not just when using `--test`.
 
 There's also a built-in pagination **loop guard**: if any single resource
 pages past 2,000 requests without the API reporting completion, the tool
