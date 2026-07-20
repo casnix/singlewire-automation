@@ -1,0 +1,104 @@
+# InformaCast Fusion Configuration Report
+
+Pulls the full configuration of a Singlewire InformaCast **Fusion** instance via its
+cloud REST API and renders it as an HTML, Word (.docx), or PDF report.
+
+This is a **read-only** tool — it only ever issues `GET` requests. It never creates,
+updates, or deletes anything in your instance.
+
+## What it does
+
+1. Authenticates to the Fusion API with a bearer token.
+2. Discovers every Domain the token's user can act in (if the instance uses Domains).
+3. For each domain, walks a registry of resources (Users, Distribution Lists, Message
+   Templates, Scenarios, Sites/Buildings/Floors/Zones, Bell Schedules, Security Groups,
+   Alarms, CUCM Clusters, etc.) — see `informacast_report/resources.py` for the full list.
+4. Follows pagination on every list endpoint until exhausted.
+5. Resolves cross-referenced IDs (e.g. a Message Template's `distributionListIds`) to
+   human-readable names where possible.
+6. Renders everything into a single report via Jinja2 (HTML), python-docx (Word), or
+   HTML→PDF (WeasyPrint).
+
+## Before you run this
+
+You need:
+
+- **A Fusion API bearer token.** In the Fusion admin console: Users → (a service/reporting
+  account) → User Tokens → Add. Give it a descriptive name. Copy the token immediately —
+  it's only shown once. As of late 2023, Singlewire no longer issues non-expiring tokens;
+  new tokens default to a 1-year expiration, so plan to rotate this.
+- **A user/role with broad read access.** A token inherits the permissions of the user
+  it belongs to. For a complete report, that user's role should have read access across
+  Users, Security Groups, Message Templates, Distribution Lists, Devices, Sites, Scenarios,
+  Telephony/CUCM, and Alarms. If the account is scoped narrowly, sections it can't see
+  will simply come back empty rather than erroring the whole run.
+- **Network access** from wherever you run this script to
+  `https://api.icmobile.singlewire.com` (or your instance's equivalent endpoint, if
+  different — some deployments use a region-specific hostname; check your admin console
+  or ask Singlewire support if unsure).
+
+## Setup
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# edit .env and paste in your token
+```
+
+## Usage
+
+```bash
+# HTML report (default)
+python main.py --format html --output report.html
+
+# Word report
+python main.py --format docx --output report.docx
+
+# PDF report (requires WeasyPrint + its system dependencies, see requirements.txt)
+python main.py --format pdf --output report.pdf
+
+# Limit to specific resource groups (comma-separated) instead of everything
+python main.py --format html --groups users,messaging,recipients
+
+# Verbose logging (prints every API call)
+python main.py --format html -v
+```
+
+## Extending it
+
+Every resource lives in `informacast_report/resources.py` as a small declarative entry:
+
+```python
+ResourceSpec(
+    key="message_templates",
+    label="Message Templates",
+    path="/message-templates",
+    group="messaging",
+    name_field="name",
+    ref_fields=["distributionListIds", "confirmationRequestId", "deviceGroupIds"],
+),
+```
+
+Adding a new endpoint (Singlewire adds these fairly often — check the API's change log
+at the bottom of https://api-docs.icmobile.singlewire.com/ or the OpenAPI docs at
+https://openapi.icmobile.singlewire.com/) is usually just adding one more entry here;
+the crawler, pagination, ID-resolution, and rendering are all generic.
+
+## Known limitations / things to verify against your instance
+
+- **Endpoint paths are based on Singlewire's published API docs** as of this writing.
+  Singlewire ships breaking changes periodically (see their change log) — if a resource
+  404s, check whether the path moved.
+- **On-prem/legacy resources** (things that live on a local Fusion server appliance
+  rather than purely in the cloud — CUCM telephony config, LPI paging, some plugin
+  configs) are exposed under an `/Fusion/V1/...` prefix in newer API versions rather
+  than the plain `/v1/...` cloud paths used for cloud-native resources. A few
+  representative entries are stubbed in `resources.py`; you'll likely need to adjust
+  these against your own instance's API Explorer.
+- **Domains**: if your instance doesn't use Domains, the domain loop just runs once
+  with the default context — no configuration needed either way.
+- **Rate limiting / large instances**: the client retries on 429/5xx with backoff, but
+  a very large instance (thousands of users/devices) will take a while and make a lot
+  of requests. Consider narrowing `--groups` for iterative testing.

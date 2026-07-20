@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>InformaCast Fusion Configuration Report</title>
+<style>
+  :root {
+    --ink: #1c2530;
+    --muted: #5b6675;
+    --line: #dde2e8;
+    --accent: #1f5f8b;
+    --warn-bg: #fff6e5;
+    --warn-border: #e8c675;
+    --err-bg: #fdecec;
+    --err-border: #e2a3a3;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink);
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 2.5rem 1.5rem 6rem;
+    line-height: 1.5;
+  }
+  h1 { font-size: 1.9rem; margin-bottom: 0.25rem; }
+  h2 { font-size: 1.4rem; border-bottom: 2px solid var(--accent); padding-bottom: 0.3rem; margin-top: 3rem; }
+  h3 { font-size: 1.15rem; margin-top: 2rem; color: var(--accent); }
+  h4 { font-size: 1rem; margin-top: 1.4rem; margin-bottom: 0.4rem; }
+  .subtitle { color: var(--muted); margin-top: 0; }
+  .meta { color: var(--muted); font-size: 0.9rem; }
+  table { border-collapse: collapse; width: 100%; margin: 0.75rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { border: 1px solid var(--line); padding: 0.4rem 0.6rem; text-align: left; vertical-align: top; }
+  th { background: #f4f6f8; font-weight: 600; }
+  tr:nth-child(even) td { background: #fafbfc; }
+  .toc { columns: 2; column-gap: 2rem; }
+  .toc a { text-decoration: none; color: var(--accent); }
+  .toc li { break-inside: avoid; margin-bottom: 0.2rem; }
+  .note {
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    border-radius: 6px;
+    padding: 0.5rem 0.8rem;
+    font-size: 0.88rem;
+    margin: 0.5rem 0 1rem;
+  }
+  .error {
+    background: var(--err-bg);
+    border: 1px solid var(--err-border);
+    border-radius: 6px;
+    padding: 0.5rem 0.8rem;
+    font-size: 0.9rem;
+    margin: 0.5rem 0 1.5rem;
+  }
+  .empty { color: var(--muted); font-style: italic; }
+  .pill {
+    display: inline-block;
+    background: #eef3f7;
+    border-radius: 999px;
+    padding: 0.05rem 0.6rem;
+    font-size: 0.8rem;
+    color: var(--accent);
+    margin-left: 0.4rem;
+  }
+  .domain-header {
+    background: #f0f4f7;
+    padding: 0.6rem 1rem;
+    border-radius: 8px;
+    margin-top: 2.5rem;
+  }
+  code { background: #f0f2f4; padding: 0.1rem 0.35rem; border-radius: 4px; font-size: 0.85em; }
+  ul.tree { list-style: none; padding-left: 1rem; }
+  ul.tree li { margin: 0.15rem 0; }
+</style>
+</head>
+<body>
+
+<h1>InformaCast Fusion Configuration Report</h1>
+<p class="subtitle">Full read-only export of instance configuration via the Fusion REST API</p>
+<p class="meta">
+  Generated {{ generated_at }} &middot; API base <code>{{ report.base_url }}</code> &middot;
+  {{ report.domains|length }} domain{{ 's' if report.domains|length != 1 else '' }} crawled
+</p>
+
+<h2>Table of Contents</h2>
+<ul class="toc">
+  {% for dr in report.domains %}
+  <li><a href="#domain-{{ loop.index }}">
+    {{ dr.domain.name if dr.domain else "Instance (no Domains configured)" }}
+  </a></li>
+  {% endfor %}
+</ul>
+
+{% for dr in report.domains %}
+<div class="domain-header" id="domain-{{ loop.index }}">
+  <h2 style="border:none;margin:0;">
+    Domain: {{ dr.domain.name if dr.domain else "Instance (no Domains configured)" }}
+  </h2>
+  {% if dr.domain %}<p class="meta">Domain ID: <code>{{ dr.domain.id }}</code></p>{% endif %}
+</div>
+
+{% for group_key, group_label in groups.items() %}
+  {% set group_resources = dr.resources.values() | selectattr("spec.group", "equalto", group_key) | list %}
+  {% if group_resources %}
+  <h2>{{ group_label }}</h2>
+
+  {% for result in group_resources %}
+    <h3>{{ result.spec.label }}
+      <span class="pill">{{ result.items|length }} item{{ 's' if result.items|length != 1 else '' }}</span>
+    </h3>
+    {% if result.spec.notes %}<div class="note">{{ result.spec.notes }}</div>{% endif %}
+
+    {% if result.error %}
+      <div class="error">Not available: {{ result.error }}</div>
+    {% elif not result.items %}
+      <p class="empty">No {{ result.spec.label.lower() }} are configured.</p>
+    {% else %}
+      <table>
+        <thead>
+          <tr>
+            {% set sample = result.items[0] %}
+            {% for field in sample.keys() %}
+              {% if not field.endswith('_resolved') and field not in ('permissions',) %}
+                <th>{{ field }}</th>
+              {% endif %}
+            {% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in result.items %}
+          <tr>
+            {% for field, value in item.items() %}
+              {% if not field.endswith('_resolved') and field not in ('permissions',) %}
+              <td>
+                {% set resolved = item.get(field ~ '_resolved') %}
+                {% if resolved is not none %}
+                  {% if resolved is iterable and resolved is not string %}
+                    {{ resolved | join(', ') }}
+                  {% else %}
+                    {{ resolved }}
+                  {% endif %}
+                {% elif value is mapping %}
+                  {{ value.get('name', value) }}
+                {% elif value is iterable and value is not string %}
+                  {{ value | join(', ') if value else '' }}
+                {% elif value is none %}
+                  <span class="empty">&mdash;</span>
+                {% else %}
+                  {{ value }}
+                {% endif %}
+              </td>
+              {% endif %}
+            {% endfor %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+  {% endfor %}
+  {% endif %}
+{% endfor %}
+
+<h2>Sites &amp; Locations (Detail Tree)</h2>
+{% if dr.sites_tree %}
+  {% for site in dr.sites_tree %}
+    <h4>{{ site.name }}</h4>
+    <ul class="tree">
+      {% for building in site.buildings %}
+      <li><strong>{{ building.name }}</strong>
+        <ul class="tree">
+          {% for floor in building.floors %}
+          <li>{{ floor.name }}
+            {% if floor.zones %}
+            <ul class="tree">
+              {% for zone in floor.zones %}<li>{{ zone.name }}</li>{% endfor %}
+            </ul>
+            {% endif %}
+          </li>
+          {% endfor %}
+        </ul>
+      </li>
+      {% endfor %}
+    </ul>
+  {% endfor %}
+{% else %}
+  <p class="empty">No sites configured (or not visible to this API account).</p>
+{% endif %}
+
+<h2>Alarm Detail (Actions &amp; Events)</h2>
+{% if dr.alarm_details %}
+  {% for alarm in dr.alarm_details %}
+    <h4>{{ alarm.type }} <span class="pill">{{ alarm.status }}</span></h4>
+    <p class="meta">Muted: {{ alarm.muted }} &middot; {{ alarm.actions|length }} action(s) configured &middot; {{ alarm.events|length }} recent event(s)</p>
+  {% endfor %}
+{% else %}
+  <p class="empty">No alarm detail available.</p>
+{% endif %}
+
+{% endfor %}
+
+</body>
+</html>
