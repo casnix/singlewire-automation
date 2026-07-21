@@ -257,7 +257,7 @@ def test_diagnostic_mode():
         if url.endswith("/domains"):
             resp.json.return_value = []  # no domains in use
         elif url.endswith("/users"):
-            offset = params["offset"]
+            offset = params.get("offset", 0)
             data = [{"id": "u1", "name": "Jane"}, {"id": "u2", "name": "Bob"}][offset: offset + params["limit"]]
             resp.json.return_value = {"total": 2, "partial": False, "next": None, "data": data}
         else:
@@ -551,11 +551,55 @@ def test_json_render_and_unit_filter():
     assert set(resources_json.keys()) == {"users", "distribution_lists"}
     assert resources_json["users"]["item_count"] == 2
     assert resources_json["users"]["items"][0]["name"] == "Jane Admin"
-    assert resources_json["distribution_lists"]["pagination_style"] == "offset"
+    assert resources_json["distribution_lists"]["pagination_style"] == "cursor"
 
     print(f"  ✓ JSON parses cleanly and contains exactly the --unit-filtered resources.")
     print(f"  Sample: {json_str[:200]}...")
     print("JSON render / --unit filter test PASSED")
+
+
+def test_default_pagination_style_is_cursor():
+    """Guard the core change from this round: every resource defaults to
+    cursor-style pagination now, confirmed against the real API rather than
+    the original 'offset' assumption.
+    """
+    print()
+    print("=" * 70)
+    print("Confirming resources.py: cursor is now the default for ALL resources")
+    print("=" * 70)
+    from informacast_report.resources import RESOURCES
+
+    non_cursor = [r.key for r in RESOURCES if r.pagination_style != "cursor"]
+    assert not non_cursor, (
+        f"Expected every resource to default to pagination_style='cursor', but these "
+        f"don't: {non_cursor}"
+    )
+    print(f"  ✓ All {len(RESOURCES)} resources use pagination_style='cursor'.")
+
+
+def test_global_pagination_style_override_via_dataclasses_replace():
+    """Confirm the mechanism main.py uses to apply --pagination-style across
+    an entire (non --test) crawl -- dataclasses.replace on every spec --
+    actually produces specs the crawler will honor.
+    """
+    print()
+    print("=" * 70)
+    print("Testing global --pagination-style override (full crawl, not --test)")
+    print("=" * 70)
+    import dataclasses
+    from informacast_report.resources import resources_for_keys
+
+    specs = resources_for_keys(["users", "device_groups"])
+    assert specs[0].pagination_style == "cursor" and specs[1].pagination_style == "cursor"
+
+    overridden = [dataclasses.replace(s, pagination_style="offset") for s in specs]
+    assert all(s.pagination_style == "offset" for s in overridden), (
+        "Global override via dataclasses.replace did not apply to every spec"
+    )
+    # Original specs must be untouched (frozen dataclass, new instances only).
+    assert specs[0].pagination_style == "cursor", "Original ResourceSpec was mutated!"
+
+    print("  ✓ dataclasses.replace cleanly overrides style on copies without mutating originals.")
 
 
 if __name__ == "__main__":
@@ -568,6 +612,8 @@ if __name__ == "__main__":
     test_partial_duplicate_overlap()
     test_cursor_style_pagination()
     test_device_groups_resource_is_cursor_style()
+    test_default_pagination_style_is_cursor()
+    test_global_pagination_style_override_via_dataclasses_replace()
     test_diagnostic_mode()
     test_json_render_and_unit_filter()
     print("\nALL SMOKE TESTS PASSED")

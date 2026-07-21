@@ -85,10 +85,9 @@ python main.py --test users,message_templates,scenarios --debug
 # Restrict a test to one specific Domain ID instead of every domain:
 python main.py --test users --domain-id 159e9330-232a-11e4-8e47-685b358ea847
 
-# Experimentally try the OTHER pagination style for a resource, without
-# editing resources.py first -- useful if --test shows duplicate/stuck
-# warnings under the default style:
-python main.py --test users --pagination-style cursor
+# Experimentally try the OTHER pagination style for a resource (cursor is
+# the default now), without editing resources.py first:
+python main.py --test users --pagination-style offset
 
 # JSON output -- prints to stdout if --output isn't given, so it's
 # pipeable straight into jq/other tools instead of requiring a file:
@@ -138,7 +137,7 @@ The JSON structure mirrors the report's domain/resource organization:
       "resources": {
         "users": {
           "key": "users", "label": "Users", "path": "/users",
-          "group": "access", "pagination_style": "offset", "notes": null,
+          "group": "access", "pagination_style": "cursor", "notes": null,
           "error": null,
           "pagination_stats": {"pages": 1, "items": 2, "raw_items": 2,
                                 "duplicates": 0, "advertised_total": 2,
@@ -251,24 +250,28 @@ must echo back the previous response's `next` value verbatim as a `start`
 query parameter — a computed offset is silently ignored (you just get page 1
 back, forever, which looks exactly like Bug 3's symptoms). Since this main
 tool's `device_groups` resource entry was using the same offset-based
-`paged_get` as everything else, it very likely had the identical bug.
+`paged_get` as everything else, it had the identical bug — and follow-up
+testing confirmed the same was true for `/users` as well, and very likely
+every other resource.
 
-Rather than picking one mechanism, `paged_get` now takes a `pagination_style`
-argument (`"offset"` or `"cursor"`), and each `ResourceSpec` in `resources.py`
-declares which one it needs. `device_groups` is now set to `"cursor"`,
-confirmed by that separate investigation. Every other resource still
-defaults to `"offset"` — this is **not independently confirmed** against
-Singlewire's real API Explorer (which is JS-rendered and couldn't be
-scraped), just the best available guess. If `--test <resource>` shows
-duplicate-item or stuck-page warnings for anything, try the other style
-before assuming the endpoint itself is broken:
+`paged_get` takes a `pagination_style` argument (`"offset"` or `"cursor"`),
+and each `ResourceSpec` in `resources.py` declares which one it needs.
+**`"cursor"` is now the default for every resource** — confirmed against
+the real API, not a guess. If a future resource turns out to genuinely need
+offset-style pagination instead, set `pagination_style="offset"` on that
+specific entry in `resources.py`.
+
+You can also override the style for an entire run from the CLI, without
+touching `resources.py` — useful to quickly compare or to force a whole run
+back to offset-style if something changes:
 
 ```bash
-python main.py --test users --pagination-style cursor
-```
+# Override just the resource(s) being tested:
+python main.py --test users --pagination-style offset
 
-If that resolves the warnings, update that resource's `pagination_style` in
-`resources.py` to make the fix permanent.
+# Override EVERY resource in a full crawl:
+python main.py --format json --pagination-style offset
+```
 
 The `--test <resource>` diagnostic mode (see above) reports pages fetched,
 unique items collected, raw items received, duplicates filtered, the

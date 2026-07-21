@@ -12,6 +12,16 @@ becomes readable instead of a wall of UUIDs.
 
 `group` is just for organizing the report and for the --groups CLI filter.
 It doesn't affect crawling.
+
+`pagination_style` defaults to "cursor" (echo back the previous response's
+`next` value verbatim as a `start` param) for every resource, confirmed
+against the real API rather than the "offset" assumption this tool started
+with — computing an offset was being silently ignored by the server on at
+least `/users` and `/device-groups`, both of which just kept re-serving
+page 1. If a future resource turns out to genuinely need offset-style
+pagination instead, set `pagination_style="offset"` on that entry
+specifically; `--pagination-style` on the CLI can also override every
+resource for a single run without editing this file, e.g. to compare.
 """
 from __future__ import annotations
 
@@ -29,7 +39,7 @@ class ResourceSpec:
     ref_fields: tuple = field(default_factory=tuple)   # fields on items that reference other resources
     domain_scoped: bool = True   # whether this resource is fetched per-domain
     notes: Optional[str] = None  # shown in the report to explain caveats
-    pagination_style: str = "offset"  # "offset" (compute offset=N) or "cursor" (echo back `next` as `start`)
+    pagination_style: str = "cursor"  # "cursor" (echo back `next` as `start`) or "offset" (compute offset=N)
 
 
 GROUPS = {
@@ -86,14 +96,10 @@ RESOURCES: list[ResourceSpec] = [
         label="Device Groups",
         path="/device-groups",
         group="recipients",
-        pagination_style="cursor",
         notes=(
-            "Confirmed via separate investigation that this endpoint uses cursor-token "
-            "pagination (echoing back `next` as a `start` param) rather than a computed "
-            "offset — passing a computed offset here was silently returning page 1 "
-            "repeatedly. Other resources default to offset-style pagination, which is "
-            "unconfirmed against Singlewire's actual API Explorer; if --test shows "
-            "duplicate/stuck warnings for any of them, try `--pagination-style cursor`."
+            "This was the first endpoint confirmed (via a separate investigation) to need "
+            "cursor-token pagination — passing a computed offset was silently returning "
+            "page 1 repeatedly. That's now the default for every resource in this file."
         ),
     ),
     ResourceSpec(

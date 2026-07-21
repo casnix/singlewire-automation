@@ -28,6 +28,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import sys
 import time
@@ -87,12 +88,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pagination-style", choices=["offset", "cursor"], default=None,
-        help="Only used with --test: override the resource's configured pagination "
-             "style for this run — 'offset' sends a computed offset=N each request; "
-             "'cursor' echoes back the previous response's `next` value as a `start` "
-             "param instead of computing anything. Use this to experimentally check "
-             "whether an endpoint showing duplicate/stuck warnings actually wants the "
-             "other style, e.g. `--test users --pagination-style cursor`.",
+        help="Override the pagination style for this run: 'cursor' (the default for "
+             "every resource — echoes back the previous response's `next` value as a "
+             "`start` param) or 'offset' (computes offset=N each request instead). "
+             "With --test, overrides just the resource(s) being tested. Without --test, "
+             "overrides EVERY resource in the crawl, regardless of what's configured in "
+             "resources.py — useful to force a whole run back to offset-style if a "
+             "future endpoint turns out to need it.",
     )
     parser.add_argument(
         "--verbose", action="store_true",
@@ -159,6 +161,13 @@ def main() -> int:
     else:
         selected_groups = set(args.groups.split(",")) if args.groups else None
         specs = resources_for_groups(selected_groups)
+
+    if args.pagination_style:
+        specs = [dataclasses.replace(s, pagination_style=args.pagination_style) for s in specs]
+        log.info(
+            "Overriding pagination_style=%r for all %d resource(s) in this run",
+            args.pagination_style, len(specs),
+        )
 
     crawler = Crawler(client, specs=specs)
 
