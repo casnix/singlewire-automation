@@ -13,14 +13,14 @@ import time
 from typing import Optional
 
 from .api_client import ApiError, FusionApiClient
-from .crawler import list_domains
+from .crawler import list_facilities
 from .resources import ResourceSpec, get_resource
 
 
 def test_resource(
     client: FusionApiClient,
     key: str,
-    domain_id_override: Optional[str] = None,
+    facility_id_override: Optional[str] = None,
     pagination_style_override: Optional[str] = None,
 ) -> bool:
     """Run a diagnostic fetch of one resource. Prints a human-readable
@@ -30,7 +30,7 @@ def test_resource(
     `pagination_style_override`, if given, overrides the resource's
     configured pagination_style ("offset" or "cursor") for this run only —
     use this to experimentally check whether an endpoint actually wants the
-    other style, e.g. `--test users --pagination-style cursor`, without
+    other style, e.g. `--test users --pagination-style offset`, without
     having to edit resources.py first.
     """
     try:
@@ -43,34 +43,41 @@ def test_resource(
 
     print(f"\n{'=' * 70}")
     print(f"Testing resource: {spec.key}  (label: {spec.label!r}, group: {spec.group})")
-    print(f"Path: {spec.path}   domain_scoped: {spec.domain_scoped}   pagination_style: {style}")
-    if pagination_style_override and pagination_style_override != spec.pagination_style:
-        print(f"  (overriding configured style {spec.pagination_style!r} for this run)")
+    if spec.is_singleton:
+        print(f"Path: {spec.path}   facility_scoped: {spec.facility_scoped}   (singleton — not paginated)")
+    else:
+        print(f"Path: {spec.path}   facility_scoped: {spec.facility_scoped}   pagination_style: {style}")
+        if pagination_style_override and pagination_style_override != spec.pagination_style:
+            print(f"  (overriding configured style {spec.pagination_style!r} for this run)")
     if spec.notes:
         print(f"Note: {spec.notes}")
     print("=" * 70)
 
     ok = True
 
-    if domain_id_override:
-        domain_targets = [{"id": domain_id_override, "name": "(specified)"}]
-    elif spec.domain_scoped:
-        domain_targets = list_domains(client)
-        if not domain_targets:
-            domain_targets = [None]
+    if facility_id_override:
+        facility_targets = [{"id": facility_id_override, "name": "(specified)"}]
+    elif spec.facility_scoped:
+        facility_targets = list_facilities(client)
+        if not facility_targets:
+            facility_targets = [None]
     else:
-        domain_targets = [None]
+        facility_targets = [None]
 
-    for domain in domain_targets:
-        domain_id = domain["id"] if domain else None
-        domain_label = domain["name"] if domain else "(no domain / instance-level)"
-        print(f"\n-- Domain: {domain_label} --")
+    for facility in facility_targets:
+        facility_id = facility["id"] if facility else None
+        facility_label = facility["name"] if facility else "(no facility / instance-level)"
+        print(f"\n-- Facility: {facility_label} --")
+
+        if spec.is_singleton:
+            _test_singleton(client, spec, facility_id)
+            continue
 
         stats: dict = {}
         start = time.monotonic()
         try:
             items = list(
-                client.paged_get(spec.path, domain_id=domain_id, stats=stats, pagination_style=style)
+                client.paged_get(spec.path, facility_id=facility_id, stats=stats, pagination_style=style)
             )
         except ApiError as exc:
             print(f"  ✗ ERROR: {exc}")
@@ -99,7 +106,7 @@ def test_resource(
         if duplicates:
             print(
                 f"  ⚠ NOTE: {duplicates} duplicate item(s) were seen across pages and "
-                "filtered out. This endpoint may not be honoring the offset parameter "
+                "filtered out. This endpoint may not be honoring the pagination cursor "
                 "reliably — re-run with --debug to see exactly which pages overlapped. "
                 "If a page ever returns the *exact same* items as the one before it, "
                 "this will raise an error instead (pagination is stuck, not just "
@@ -137,6 +144,25 @@ def test_resource(
 
     print()
     return ok
+
+
+def _test_singleton(client: FusionApiClient, spec: ResourceSpec, facility_id: Optional[str]) -> None:
+    """Diagnostic path for a singleton (non-list) resource, e.g. /settings."""
+    start = time.monotonic()
+    try:
+        obj = client.get_one(spec.path, facility_id=facility_id)
+    except ApiError as exc:
+        print(f"  ✗ ERROR: {exc}")
+        return
+    elapsed = time.monotonic() - start
+
+    print(f"  Envelope shape:       singleton (single object, no pagination)")
+    print(f"  Time taken:           {elapsed:.2f}s")
+    if obj:
+        print(f"  Fields:               {list(obj.keys())}")
+        print(f"  Object:               {_short(obj)}")
+    else:
+        print("  (empty/null response)")
 
 
 def _short(item: dict, max_len: int = 160) -> str:

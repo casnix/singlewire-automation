@@ -42,8 +42,8 @@ class FusionApiClient:
 
     Usage:
         client = FusionApiClient(settings)
-        for domain in client.list_domains():
-            for user in client.paged_get("/users", domain_id=domain["id"]):
+        for facility in client.list_facilities():
+            for user in client.paged_get("/users", facility_id=facility["id"]):
                 ...
     """
 
@@ -64,18 +64,18 @@ class FusionApiClient:
         self,
         path: str,
         params: Optional[dict] = None,
-        domain_id: Optional[str] = None,
+        facility_id: Optional[str] = None,
     ) -> requests.Response:
         url = path if path.startswith("http") else f"{self.base_url}{path}"
         headers = {}
-        if domain_id:
-            headers["x-singlewire-domain"] = domain_id
+        if facility_id:
+            headers["x-singlewire-facility"] = facility_id
 
         attempt = 0
         while True:
             attempt += 1
             call_start = time.monotonic()
-            logger.debug("GET %s params=%s domain=%s attempt=%d", url, params, domain_id, attempt)
+            logger.debug("GET %s params=%s facility=%s attempt=%d", url, params, facility_id, attempt)
             try:
                 resp = self.session.get(
                     url, params=params, headers=headers, timeout=self.timeout
@@ -144,14 +144,14 @@ class FusionApiClient:
 
     # -- higher level ----------------------------------------------------
 
-    def get_one(self, path: str, domain_id: Optional[str] = None) -> dict:
+    def get_one(self, path: str, facility_id: Optional[str] = None) -> dict:
         """GET a single (non-list) resource."""
-        return self._get(path, domain_id=domain_id).json()
+        return self._get(path, facility_id=facility_id).json()
 
     def paged_get(
         self,
         path: str,
-        domain_id: Optional[str] = None,
+        facility_id: Optional[str] = None,
         extra_params: Optional[dict] = None,
         limit: int = DEFAULT_PAGE_LIMIT,
         stats: Optional[dict] = None,
@@ -266,7 +266,7 @@ class FusionApiClient:
                 params.update(extra_params)
 
             page_start = time.monotonic()
-            payload = self._get(path, params=params, domain_id=domain_id).json()
+            payload = self._get(path, params=params, facility_id=facility_id).json()
             page_elapsed = time.monotonic() - page_start
 
             if isinstance(payload, list):

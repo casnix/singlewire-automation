@@ -16,7 +16,7 @@ from informacast_report.logging_utils import setup_logging
 from informacast_report.resources import RESOURCES
 
 FAKE_DATA = {
-    "/domains": [],  # no domains in this fake instance
+    "/facilities": [],  # no facilities in this fake instance
     "/users": [
         {"id": "u1", "name": "Jane Admin", "email": "jane@example.com", "isLocked": False},
         {"id": "u2", "name": "API Service Account", "email": "svc@example.com", "isLocked": False},
@@ -56,8 +56,21 @@ FAKE_DATA = {
     "/alarms/al1/events": [],
 }
 
+# Singleton (non-list) resources are handled separately -- a plain dict per
+# path, fetched via get_one() rather than paged_get().
+FAKE_SINGLETON_DATA = {
+    "/settings": {"orgName": "Example Org", "timezone": "America/Chicago"},
+    # /ip-speaker-settings intentionally omitted -- exercises the 404 path.
+}
 
-def fake_paged_get(self, path, domain_id=None, extra_params=None, limit=100, stats=None, pagination_style="offset"):
+
+def fake_get_one(self, path, facility_id=None):
+    if path in FAKE_SINGLETON_DATA:
+        return FAKE_SINGLETON_DATA[path]
+    raise ApiError(f"404 Not Found for {path}", 404, path)
+
+
+def fake_paged_get(self, path, facility_id=None, extra_params=None, limit=100, stats=None, pagination_style="offset"):
     data = FAKE_DATA.get(path)
     if data is None:
         raise ApiError(f"404 Not Found for {path}", 404, path)
@@ -70,17 +83,18 @@ def main():
     settings = Settings(token="fake-token", base_url="https://api.icmobile.singlewire.com/api/v1", timeout=30)
     client = FusionApiClient(settings)
 
-    with patch.object(FusionApiClient, "paged_get", fake_paged_get):
+    with patch.object(FusionApiClient, "paged_get", fake_paged_get), \
+         patch.object(FusionApiClient, "get_one", fake_get_one):
         crawler = Crawler(client, specs=RESOURCES)
         report = crawler.run()
 
-    print(f"Crawled {len(report.domains)} domain(s)")
-    for dr in report.domains:
-        for key, result in dr.resources.items():
+    print(f"Crawled {len(report.facilities)} facility(ies)")
+    for fr in report.facilities:
+        for key, result in fr.resources.items():
             status = f"ERROR: {result.error}" if result.error else f"{len(result.items)} item(s)"
             print(f"  {key}: {status}")
-        print(f"  sites_tree: {dr.sites_tree}")
-        print(f"  alarm_details: {dr.alarm_details}")
+        print(f"  sites_tree: {fr.sites_tree}")
+        print(f"  alarm_details: {fr.alarm_details}")
 
     from informacast_report.render_html import render_html
     html = render_html(report)
@@ -254,8 +268,8 @@ def test_diagnostic_mode():
     def router(url, params=None, headers=None, timeout=None):
         call_log.append(url)
         resp = MagicMock(status_code=200, ok=True, content=b"x" * 50)
-        if url.endswith("/domains"):
-            resp.json.return_value = []  # no domains in use
+        if url.endswith("/facilities"):
+            resp.json.return_value = []  # no facilities in use
         elif url.endswith("/users"):
             offset = params.get("offset", 0)
             data = [{"id": "u1", "name": "Jane"}, {"id": "u2", "name": "Bob"}][offset: offset + params["limit"]]
@@ -527,10 +541,10 @@ def test_json_render_and_unit_filter():
         crawler = Crawler(client, specs=unit_specs)
         report = crawler.run()
 
-    domain_resources = report.domains[0].resources
-    assert set(domain_resources.keys()) == {"users", "distribution_lists"}, (
+    facility_resources = report.facilities[0].resources
+    assert set(facility_resources.keys()) == {"users", "distribution_lists"}, (
         f"Expected only users+distribution_lists to be crawled with --unit, got "
-        f"{set(domain_resources.keys())}"
+        f"{set(facility_resources.keys())}"
     )
 
     # Unknown key must raise KeyError with a helpful message, not crash weirdly.
@@ -546,8 +560,8 @@ def test_json_render_and_unit_filter():
     parsed = json.loads(json_str)  # must be valid JSON
 
     assert parsed["base_url"] == settings.base_url
-    assert len(parsed["domains"]) == 1
-    resources_json = parsed["domains"][0]["resources"]
+    assert len(parsed["facilities"]) == 1
+    resources_json = parsed["facilities"][0]["resources"]
     assert set(resources_json.keys()) == {"users", "distribution_lists"}
     assert resources_json["users"]["item_count"] == 2
     assert resources_json["users"]["items"][0]["name"] == "Jane Admin"
@@ -602,6 +616,167 @@ def test_global_pagination_style_override_via_dataclasses_replace():
     print("  ✓ dataclasses.replace cleanly overrides style on copies without mutating originals.")
 
 
+def test_new_granular_resources_registered():
+    """Guard the additions from this round: DialCast, CallAware, Inbound
+    CAP/Email/RSS, and finer-grained recipient/device resources should all
+    be present and reachable by key, using paths CONFIRMED against the real
+    OpenAPI spec (not the guesses from the previous round -- several of
+    those were wrong and have been corrected/replaced).
+    """
+    print()
+    print("=" * 70)
+    print("Confirming newly added granular notification/device/recipient resources")
+    print("=" * 70)
+    from informacast_report.resources import get_resource
+
+    expected_keys = [
+        "dial_cast", "dial_cast_phone_exceptions", "inbound_cap_rules", "inbound_email",
+        "inbound_rss_feeds", "active_callaware_calls", "gateways",
+        "ip_speakers", "ip_speaker_sip_parameters", "ip_speaker_jobs", "ip_speaker_settings",
+        "tts_voices", "tts_lexicons", "tts_defaults", "incidents", "facilities",
+    ]
+    for key in expected_keys:
+        spec = get_resource(key)  # raises KeyError if missing
+        if not spec.is_singleton:
+            assert spec.pagination_style == "cursor"
+        assert spec.path.startswith("/"), f"{key} has a suspicious path: {spec.path!r}"
+
+    # Guard against the wrong guesses from last round silently coming back.
+    from informacast_report.resources import RESOURCE_BY_KEY
+    removed_wrong_guesses = [
+        "inbound_cap", "inbound_rss", "call_aware_redirects", "paging_gateways",
+        "roll_call", "endpoints", "recipient_group_tags", "desktop_notifiers", "domains",
+    ]
+    for key in removed_wrong_guesses:
+        assert key not in RESOURCE_BY_KEY, (
+            f"{key!r} should have been removed/replaced after spec validation, but it's back"
+        )
+
+    print(f"  ✓ All {len(expected_keys)} new resources are registered and reachable.")
+    print(f"  ✓ All {len(removed_wrong_guesses)} incorrect prior guesses are confirmed gone.")
+
+
+def test_singleton_resource_handling():
+    """Confirm is_singleton resources (settings, ip_speaker_settings) are
+    fetched via get_one() and wrapped as a 1-item list, not treated as a
+    paginated list (which would have silently returned zero items, as it
+    did before this was fixed).
+    """
+    print()
+    print("=" * 70)
+    print("Testing singleton resource handling (e.g. /settings)")
+    print("=" * 70)
+    from informacast_report.resources import get_resource, resources_for_keys
+
+    settings_spec = get_resource("settings")
+    assert settings_spec.is_singleton is True
+
+    settings = Settings(token="fake-token", base_url="https://fake.example.com/api/v1", timeout=30)
+    client = FusionApiClient(settings)
+    client.get_one = MagicMock(return_value={"orgName": "Example Org"})
+
+    crawler = Crawler(client, specs=resources_for_keys(["settings"]))
+    # Bypass /facilities lookup for this narrow test -- just exercise one facility context.
+    fr = crawler._crawl_facility(None)
+
+    result = fr.resources["settings"]
+    assert result.error is None
+    assert len(result.items) == 1
+    assert result.items[0] == {"orgName": "Example Org"}
+    assert result.pagination_stats.get("envelope") == "singleton"
+    client.get_one.assert_called_once()
+
+    print("  ✓ Singleton resource fetched via get_one() and wrapped correctly, not silently empty.")
+
+
+def test_extension_tree_crawl():
+    """Confirm the new nested Extension -> Devices/Endpoints crawl works,
+    since Endpoints don't exist as a flat top-level resource in the real API
+    (confirmed via OpenAPI spec) -- they're only reachable per-Extension.
+    """
+    print()
+    print("=" * 70)
+    print("Testing Extension tree crawl (nested Devices & Endpoints)")
+    print("=" * 70)
+    from informacast_report.resources import resources_for_keys
+
+    settings = Settings(token="fake-token", base_url="https://fake.example.com/api/v1", timeout=30)
+    client = FusionApiClient(settings)
+
+    extensions_data = [{"id": "ext1", "name": "SchoolMessenger"}]
+    nested_data = {
+        "/extensions/ext1/devices": [{"id": "dev1", "name": "Device A"}],
+        "/extensions/ext1/endpoints": [{"id": "ep1", "name": "Endpoint A", "type": "SCHOOL_MESSENGER"}],
+    }
+
+    def fake_paged(self, path, facility_id=None, extra_params=None, limit=100, stats=None, pagination_style="cursor"):
+        if path == "/extensions":
+            yield from extensions_data
+        elif path in nested_data:
+            yield from nested_data[path]
+        else:
+            raise ApiError(f"404 Not Found for {path}", 404, path)
+
+    with patch.object(FusionApiClient, "paged_get", fake_paged):
+        crawler = Crawler(client, specs=resources_for_keys(["extensions"]))
+        fr = crawler._crawl_facility(None)
+
+    assert len(fr.extension_tree) == 1
+    ext = fr.extension_tree[0]
+    assert ext["name"] == "SchoolMessenger"
+    assert ext["devices"] == [{"id": "dev1", "name": "Device A"}]
+    assert ext["endpoints"] == [{"id": "ep1", "name": "Endpoint A", "type": "SCHOOL_MESSENGER"}]
+
+    print("  ✓ Extension tree correctly nests Devices and Endpoints per-extension.")
+
+
+def test_facility_terminology_and_header():
+    """Confirm the Facility fix: /facilities is called (not /domains), and
+    the x-singlewire-facility header (not x-singlewire-domain) is sent.
+    """
+    print()
+    print("=" * 70)
+    print("Testing Facility terminology/header fix")
+    print("=" * 70)
+    from informacast_report.crawler import list_facilities
+
+    settings = Settings(token="fake-token", base_url="https://fake.example.com/api/v1", timeout=30)
+    client = FusionApiClient(settings)
+
+    calls = []
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        calls.append((url, dict(headers or {})))
+        resp = MagicMock(status_code=200, ok=True, content=b"x" * 50)
+        if url.endswith("/facilities"):
+            resp.json.return_value = {
+                "total": 1, "partial": False, "next": None,
+                "data": [{"id": "fac1", "name": "Main Campus"}],
+            }
+        else:
+            resp.json.return_value = {"total": 0, "partial": False, "next": None, "data": []}
+        return resp
+
+    client.session.get = MagicMock(side_effect=fake_get)
+
+    facilities = list_facilities(client)
+    assert facilities == [{"id": "fac1", "name": "Main Campus"}]
+    assert any(url.endswith("/facilities") for url, _ in calls), "list_facilities() did not call /facilities"
+    assert not any(url.endswith("/domains") for url, _ in calls), "list_facilities() should never call /domains"
+
+    # Now confirm the header name used when a facility_id is passed through.
+    list(client.paged_get("/users", facility_id="fac1"))
+    header_calls = [h for _, h in calls if h]
+    assert any("x-singlewire-facility" in h for h in header_calls), (
+        "Expected x-singlewire-facility header to be sent, got: " + str(header_calls)
+    )
+    assert not any("x-singlewire-domain" in h for h in header_calls), (
+        "x-singlewire-domain should never be sent -- that header doesn't exist in the real API"
+    )
+
+    print("  ✓ /facilities called (not /domains), x-singlewire-facility header sent (not x-singlewire-domain).")
+
+
 if __name__ == "__main__":
     main()
     test_logging_levels()
@@ -614,6 +789,10 @@ if __name__ == "__main__":
     test_device_groups_resource_is_cursor_style()
     test_default_pagination_style_is_cursor()
     test_global_pagination_style_override_via_dataclasses_replace()
+    test_new_granular_resources_registered()
+    test_singleton_resource_handling()
+    test_extension_tree_crawl()
+    test_facility_terminology_and_header()
     test_diagnostic_mode()
     test_json_render_and_unit_filter()
     print("\nALL SMOKE TESTS PASSED")

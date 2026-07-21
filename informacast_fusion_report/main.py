@@ -82,9 +82,11 @@ def parse_args() -> argparse.Namespace:
         help="Print every known resource key (for use with --test or --groups) and exit.",
     )
     parser.add_argument(
-        "--domain-id", default=None,
-        help="Only used with --test: restrict the test to one specific Domain ID "
-             "instead of testing every domain the token can act in.",
+        "--facility-id", default=None,
+        help="Only used with --test: restrict the test to one specific Facility ID "
+             "instead of testing every facility the token can act in. ('Facility' is "
+             "this API's real multi-tenancy concept -- see --list-resources' facilities "
+             "entry, or the README, for background.)",
     )
     parser.add_argument(
         "--pagination-style", choices=["offset", "cursor"], default=None,
@@ -99,7 +101,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--verbose", action="store_true",
         help="Print progress as it works: one line per resource fetched "
-             "(item count, time taken), per-domain start/end, and pagination "
+             "(item count, time taken), per-facility start/end, and pagination "
              "progress on large lists. Good for watching a long run and "
              "spotting a resource that's unexpectedly slow or huge.",
     )
@@ -124,7 +126,8 @@ def main() -> int:
             print(f"\n{group_label} ({group_key}):")
             for spec in RESOURCES:
                 if spec.group == group_key:
-                    print(f"  {spec.key:28s} {spec.path:35s} [{spec.pagination_style}]")
+                    style_tag = "singleton" if spec.is_singleton else spec.pagination_style
+                    print(f"  {spec.key:28s} {spec.path:35s} [{style_tag}]")
         return 0
 
     try:
@@ -141,7 +144,7 @@ def main() -> int:
         for key in keys:
             ok = test_resource(
                 client, key,
-                domain_id_override=args.domain_id,
+                facility_id_override=args.facility_id,
                 pagination_style_override=args.pagination_style,
             )
             all_ok = all_ok and ok
@@ -192,7 +195,7 @@ def main() -> int:
         else:
             # No --output given: print to stdout instead of forcing a file,
             # so this is pipeable, e.g.:
-            #   python main.py --format json --unit users | jq '.domains[0].resources.users.items'
+            #   python main.py --format json --unit users | jq '.facilities[0].resources.users.items'
             log.progress("Render finished in %.2fs", time.monotonic() - render_start)
             print(json_str)
         return 0

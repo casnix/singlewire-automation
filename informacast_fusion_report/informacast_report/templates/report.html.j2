@@ -62,7 +62,7 @@
     color: var(--accent);
     margin-left: 0.4rem;
   }
-  .domain-header {
+  .facility-header {
     background: #f0f4f7;
     padding: 0.6rem 1rem;
     border-radius: 8px;
@@ -79,34 +79,35 @@
 <p class="subtitle">Full read-only export of instance configuration via the Fusion REST API</p>
 <p class="meta">
   Generated {{ generated_at }} &middot; API base <code>{{ report.base_url }}</code> &middot;
-  {{ report.domains|length }} domain{{ 's' if report.domains|length != 1 else '' }} crawled
+  {{ report.facilities|length }} facilit{{ 'y' if report.facilities|length == 1 else 'ies' }} crawled
 </p>
 
 <h2>Table of Contents</h2>
 <ul class="toc">
-  {% for dr in report.domains %}
-  <li><a href="#domain-{{ loop.index }}">
-    {{ dr.domain.name if dr.domain else "Instance (no Domains configured)" }}
+  {% for fr in report.facilities %}
+  <li><a href="#facility-{{ loop.index }}">
+    {{ fr.facility.name if fr.facility else "Instance (no Facilities configured)" }}
   </a></li>
   {% endfor %}
 </ul>
 
-{% for dr in report.domains %}
-<div class="domain-header" id="domain-{{ loop.index }}">
+{% for fr in report.facilities %}
+<div class="facility-header" id="facility-{{ loop.index }}">
   <h2 style="border:none;margin:0;">
-    Domain: {{ dr.domain.name if dr.domain else "Instance (no Domains configured)" }}
+    Facility: {{ fr.facility.name if fr.facility else "Instance (no Facilities configured)" }}
   </h2>
-  {% if dr.domain %}<p class="meta">Domain ID: <code>{{ dr.domain.id }}</code></p>{% endif %}
+  {% if fr.facility %}<p class="meta">Facility ID: <code>{{ fr.facility.id }}</code></p>{% endif %}
 </div>
 
 {% for group_key, group_label in groups.items() %}
-  {% set group_resources = dr.resources.values() | selectattr("spec.group", "equalto", group_key) | list %}
+  {% set group_resources = fr.resources.values() | selectattr("spec.group", "equalto", group_key) | list %}
   {% if group_resources %}
   <h2>{{ group_label }}</h2>
 
   {% for result in group_resources %}
     <h3>{{ result.spec.label }}
       <span class="pill">{{ result.items|length }} item{{ 's' if result.items|length != 1 else '' }}</span>
+      {% if result.spec.is_singleton %}<span class="pill">singleton</span>{% endif %}
     </h3>
     {% if result.spec.notes %}<div class="note">{{ result.spec.notes }}</div>{% endif %}
 
@@ -161,8 +162,8 @@
 {% endfor %}
 
 <h2>Sites &amp; Locations (Detail Tree)</h2>
-{% if dr.sites_tree %}
-  {% for site in dr.sites_tree %}
+{% if fr.sites_tree %}
+  {% for site in fr.sites_tree %}
     <h4>{{ site.name }}</h4>
     <ul class="tree">
       {% for building in site.buildings %}
@@ -186,9 +187,24 @@
   <p class="empty">No sites configured (or not visible to this API account).</p>
 {% endif %}
 
+<h2>Extensions Detail (Devices &amp; Endpoints)</h2>
+{% if fr.extension_tree %}
+  {% for ext in fr.extension_tree %}
+    <h4>{{ ext.name or ext.id }}</h4>
+    <p class="meta">{{ ext.devices|length }} device(s) &middot; {{ ext.endpoints|length }} endpoint(s){% if ext.disabled %} &middot; <strong>disabled</strong>{% endif %}</p>
+    {% if ext.endpoints %}
+    <ul class="tree">
+      {% for ep in ext.endpoints %}<li>{{ ep.name or ep.id }}{% if ep.type %} ({{ ep.type }}){% endif %}</li>{% endfor %}
+    </ul>
+    {% endif %}
+  {% endfor %}
+{% else %}
+  <p class="empty">No extensions configured (or not visible to this API account).</p>
+{% endif %}
+
 <h2>Alarm Detail (Actions &amp; Events)</h2>
-{% if dr.alarm_details %}
-  {% for alarm in dr.alarm_details %}
+{% if fr.alarm_details %}
+  {% for alarm in fr.alarm_details %}
     <h4>{{ alarm.type }} <span class="pill">{{ alarm.status }}</span></h4>
     <p class="meta">Muted: {{ alarm.muted }} &middot; {{ alarm.actions|length }} action(s) configured &middot; {{ alarm.events|length }} recent event(s)</p>
   {% endfor %}

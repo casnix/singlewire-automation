@@ -1,6 +1,6 @@
 """JSON rendering of a crawled InstanceReport -- for piping into other
 tools, jq, diffing between runs, etc., rather than reading a formatted
-report. Structure mirrors the HTML/DOCX reports (domains -> resources ->
+report. Structure mirrors the HTML/DOCX reports (facilities -> resources ->
 items) but stays close to the raw crawled data instead of being flattened
 for display.
 """
@@ -18,9 +18,9 @@ def build_json_dict(report: InstanceReport) -> dict:
     return {
         "base_url": report.base_url,
         "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "domains": [
+        "facilities": [
             {
-                "domain": dr.domain,  # None if the instance doesn't use Domains
+                "facility": fr.facility,  # None if the instance doesn't use multiple Facilities
                 "resources": {
                     key: {
                         "key": result.spec.key,
@@ -28,18 +28,20 @@ def build_json_dict(report: InstanceReport) -> dict:
                         "path": result.spec.path,
                         "group": result.spec.group,
                         "pagination_style": result.spec.pagination_style,
+                        "is_singleton": result.spec.is_singleton,
                         "notes": result.spec.notes,
                         "error": result.error,
                         "pagination_stats": result.pagination_stats,
                         "item_count": len(result.items),
                         "items": result.items,
                     }
-                    for key, result in dr.resources.items()
+                    for key, result in fr.resources.items()
                 },
-                "sites_tree": dr.sites_tree,
-                "alarm_details": dr.alarm_details,
+                "sites_tree": fr.sites_tree,
+                "extension_tree": fr.extension_tree,
+                "alarm_details": fr.alarm_details,
             }
-            for dr in report.domains
+            for fr in report.facilities
         ],
     }
 

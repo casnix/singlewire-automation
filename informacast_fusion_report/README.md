@@ -9,15 +9,21 @@ updates, or deletes anything in your instance.
 ## What it does
 
 1. Authenticates to the Fusion API with a bearer token.
-2. Discovers every Domain the token's user can act in (if the instance uses Domains).
-3. For each domain, walks a registry of resources (Users, Distribution Lists, Message
+2. Discovers every Facility the token's user can act in (if the instance uses multiple
+   Facilities — this API's real multi-tenancy concept; see "The Facility/Domain bug" below).
+3. For each facility, walks a registry of resources (Users, Distribution Lists, Message
    Templates, Scenarios, Sites/Buildings/Floors/Zones, Bell Schedules, Security Groups,
-   Alarms, CUCM Clusters, etc.) — see `informacast_report/resources.py` for the full list.
-4. Follows pagination on every list endpoint until exhausted.
+   Alarms, CUCM Clusters, DialCast, Inbound CAP/Email/RSS triggers, Gateways, IP Speakers,
+   etc.) — see `informacast_report/resources.py` for the full list, or run
+   `python main.py --list-resources`.
+4. Follows pagination on every list endpoint until exhausted; fetches singleton
+   config objects (e.g. `/settings`) directly rather than as a list.
 5. Resolves cross-referenced IDs (e.g. a Message Template's `distributionListIds`) to
    human-readable names where possible.
-6. Renders everything into a single report via Jinja2 (HTML), python-docx (Word), or
-   HTML→PDF (WeasyPrint).
+6. Separately crawls each Site's Buildings/Floors/Zones, each Alarm's Actions/Events, and
+   each Extension's Devices/Endpoints, since none of those exist as flat top-level lists.
+7. Renders everything into a single report via Jinja2 (HTML), python-docx (Word),
+   HTML→PDF (WeasyPrint), or structured JSON.
 
 ## Before you run this
 
@@ -63,7 +69,7 @@ python main.py --format pdf --output report.pdf
 python main.py --format html --groups users,messaging,recipients
 
 # Progress logging: one line per resource fetched, with item counts and
-# timing, plus per-domain start/end. Good for watching a long run.
+# timing, plus per-facility start/end. Good for watching a long run.
 python main.py --format html --verbose
 
 # Full trace: everything --verbose shows, plus raw HTTP status/timing per
@@ -82,8 +88,8 @@ python main.py --test users
 # Test more than one at once, with full HTTP tracing:
 python main.py --test users,message_templates,scenarios --debug
 
-# Restrict a test to one specific Domain ID instead of every domain:
-python main.py --test users --domain-id 159e9330-232a-11e4-8e47-685b358ea847
+# Restrict a test to one specific Facility ID instead of every facility:
+python main.py --test users --facility-id 159e9330-232a-11e4-8e47-685b358ea847
 
 # Experimentally try the OTHER pagination style for a resource (cursor is
 # the default now), without editing resources.py first:
@@ -98,7 +104,7 @@ python main.py --format json --output report.json
 # more precise than --groups (which pulls a whole category). Great paired
 # with --format json to grab just one resource's raw data:
 python main.py --format json --unit users
-python main.py --format json --unit users,message_templates | jq '.domains[0].resources.users.items'
+python main.py --format json --unit users,message_templates | jq '.facilities[0].resources.users.items'
 ```
 
 ### JSON output and `--unit`
@@ -125,15 +131,15 @@ pull just the data you need:
 python main.py --format json --unit users,distribution_lists --output subset.json
 ```
 
-The JSON structure mirrors the report's domain/resource organization:
+The JSON structure mirrors the report's facility/resource organization:
 
 ```json
 {
   "base_url": "...",
   "generated_at": "...",
-  "domains": [
+  "facilities": [
     {
-      "domain": null,
+      "facility": null,
       "resources": {
         "users": {
           "key": "users", "label": "Users", "path": "/users",
@@ -157,7 +163,7 @@ The JSON structure mirrors the report's domain/resource organization:
 
 | Flag | What you see |
 |---|---|
-| *(none)* | Milestones only: crawl start, one line per domain, final summary, output path. |
+| *(none)* | Milestones only: crawl start, one line per facility, final summary, output path. |
 | `--verbose` | Adds: one line per resource (path, item count, elapsed time), site-tree/alarm-detail fetch progress, reference-resolution progress, render timing. |
 | `--debug` | Adds: every HTTP GET (URL, params, status, latency, response size), retry/backoff decisions, and per-page pagination detail (offset, `partial`, `next`, `total`). |
 
@@ -165,7 +171,7 @@ The JSON structure mirrors the report's domain/resource organization:
 
 If you suspect a specific area isn't coming through completely — e.g. "I
 think Users isn't paginating" — `--test` fetches just that one resource,
-across every domain, and prints exactly what happened instead of making you
+across every facility, and prints exactly what happened instead of making you
 dig through a full crawl or report:
 
 ```
@@ -173,10 +179,10 @@ $ python main.py --test users
 
 ======================================================================
 Testing resource: users  (label: 'Users', group: access)
-Path: /users   domain_scoped: True
+Path: /users   facility_scoped: True
 ======================================================================
 
--- Domain: (no domain / instance-level) --
+-- Facility: (no facility / instance-level) --
   Envelope shape:       paginated
   Pages fetched:        3
   Unique items:         250
@@ -286,6 +292,41 @@ a strong signal of either a bug in how a response is being read or an
 unexpected API behavior on that endpoint. `--debug` will show you exactly
 what the last few pages looked like leading up to it.
 
+**Update:** all of the above is now independently confirmed against the real
+OpenAPI spec (`spec.json`, obtained from Singlewire's API Explorer) — every
+single list endpoint in the spec (192 checked) uses `limit`/`start`
+("cursor" style), and **zero** use `offset`. The original "offset" guess this
+tool started with was wrong for every endpoint, not just the ones the
+duplicate/stuck-page detector happened to catch.
+
+### The Facility/Domain bug
+
+Separately from pagination, this tool's multi-tenancy handling had a real bug
+from the start, only caught once the real OpenAPI spec was available to check
+against: **there is no `/domains` endpoint anywhere in this API.** The real
+multi-tenancy concept is called **"Facility"** — listed at `/v1/facilities`,
+scoped per-request via the header `x-singlewire-facility` (or a `facility`
+query/body parameter) — not `/domains` / `x-singlewire-domain`, which is what
+this tool sent from the beginning.
+
+Because `/domains` always 404s, `list_domains()` (as it was then) silently
+caught that as "this instance doesn't use multi-tenancy" and skipped
+facility-scoping entirely on every run. For a single-facility instance this
+is harmless — there's nothing to miss. But **any instance actually using
+multiple Facilities has only ever had its default facility crawled**, with
+every other facility's Users, Distribution Lists, Message Templates, etc.
+silently absent from the report, with no error or warning to indicate
+anything was missing.
+
+This is now fixed throughout: `list_facilities()` calls `/v1/facilities`, the
+`x-singlewire-facility` header is sent correctly, and the report/JSON output
+use "Facility" terminology (`--facility-id` on the CLI, `facilities` in JSON,
+etc.) to match the real API rather than a guessed concept.
+
+If you're on a single-facility instance, this changes nothing about your
+output. If you manage multiple Facilities, previous reports generated by this
+tool should be treated as incomplete and re-generated.
+
 ## Extending it
 
 Every resource lives in `informacast_report/resources.py` as a small declarative entry:
@@ -301,6 +342,31 @@ ResourceSpec(
 ),
 ```
 
+Two other shapes exist beyond a normal paginated list:
+
+- **Singleton resources** (a single config object, not a list — e.g. `/settings`):
+  set `is_singleton=True`. The crawler fetches these with `client.get_one()` instead of
+  `client.paged_get()` and wraps the result as a 1-item list so it renders like
+  everything else.
+- **Nested-only resources** that don't exist as a flat top-level list (e.g. Endpoints,
+  which only exist per-Extension at `/extensions/{id}/endpoints`) aren't declared as a
+  `ResourceSpec` at all — they're fetched specially in `crawler.py`, the same way
+  Sites→Buildings→Floors→Zones and Alarms→Actions/Events are. See
+  `Crawler._crawl_extension_tree` for the pattern to copy if you find another one.
+
+**If you have access to the OpenAPI spec** (`spec.json`, downloadable from
+https://openapi.icmobile.singlewire.com/ or via Singlewire support), validate any new
+entry against it before assuming a path is right — this is exactly how the Facility bug
+above, several wrong path guesses, and the `/settings` singleton bug were all caught:
+
+```python
+import json
+spec = json.load(open("spec.json"))
+paths = spec["paths"]
+"/v1/your-guessed-path" in paths          # does it exist at all?
+paths["/v1/your-guessed-path"]["get"]["parameters"]   # limit/start? offset? neither (singleton)?
+```
+
 Adding a new endpoint (Singlewire adds these fairly often — check the API's change log
 at the bottom of https://api-docs.icmobile.singlewire.com/ or the OpenAPI docs at
 https://openapi.icmobile.singlewire.com/) is usually just adding one more entry here;
@@ -308,17 +374,26 @@ the crawler, pagination, ID-resolution, and rendering are all generic.
 
 ## Known limitations / things to verify against your instance
 
-- **Endpoint paths are based on Singlewire's published API docs** as of this writing.
-  Singlewire ships breaking changes periodically (see their change log) — if a resource
-  404s, check whether the path moved.
+- **Most paths are now confirmed against the real OpenAPI spec**, not guessed. Every
+  resource's `path` in `resources.py` was checked directly against `spec.json` (obtained
+  from Singlewire's API Explorer at https://openapi.icmobile.singlewire.com/) as of this
+  writing — see "The Facility/Domain bug" below for how much this mattered. Singlewire
+  ships changes periodically, so if a resource 404s in the future, check whether the
+  path moved; `python main.py --test <key> --debug` is the fastest way to check one.
+- **Some DialCast fields aren't resolved to names.** A DialCast Dialing Configuration's
+  message/notification reference is nested inside a sub-object (`notification`) rather
+  than a flat `messageTemplateId` field, so it isn't cross-referenced to a name the way
+  most other resources are — see the raw item in the report for details.
+- **Facility-level rate limiting**: `active_callaware_calls` and `incidents` return
+  live/runtime data rather than static configuration and can be large on an active
+  instance. Consider testing these individually first: `python main.py --test incidents`.
 - **On-prem/legacy resources** (things that live on a local Fusion server appliance
-  rather than purely in the cloud — CUCM telephony config, LPI paging, some plugin
-  configs) are exposed under an `/Fusion/V1/...` prefix in newer API versions rather
-  than the plain `/v1/...` cloud paths used for cloud-native resources. A few
-  representative entries are stubbed in `resources.py`; you'll likely need to adjust
-  these against your own instance's API Explorer.
-- **Domains**: if your instance doesn't use Domains, the domain loop just runs once
-  with the default context — no configuration needed either way.
+  rather than purely in the cloud — some plugin configs) are exposed under an
+  `/Fusion/V1/...` prefix and aren't present in the cloud OpenAPI spec at all, so they
+  couldn't be validated the same way. A few representative entries
+  (`fusion_recipient_groups`, `fusion_callaware`, `fusion_m2m`, `fusion_night_bell`) are
+  stubbed in `resources.py`, explicitly flagged as unverified against the cloud spec —
+  check these against your own on-prem Fusion server's API Explorer if you rely on them.
 - **Rate limiting / large instances**: the client retries on 429/5xx with backoff, but
   a very large instance (thousands of users/devices) will take a while and make a lot
-  of requests. Consider narrowing `--groups` for iterative testing.
+  of requests. Consider narrowing `--groups` or `--unit` for iterative testing.
