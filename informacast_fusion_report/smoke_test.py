@@ -777,6 +777,149 @@ def test_facility_terminology_and_header():
     print("  ✓ /facilities called (not /domains), x-singlewire-facility header sent (not x-singlewire-domain).")
 
 
+def test_narrative_end_to_end():
+    """End-to-end test of the new instance-specific narrative feature:
+    builds a realistic mocked instance (DialCast configs referencing both a
+    shared Message Template and an embedded/direct recipient, an Extension
+    with devices/endpoints, an empty Device Group, an unreferenced
+    Distribution List, an unhealthy alarm) and confirms the narrative
+    correctly resolves names, traces the DialCast -> notification ->
+    recipients chain, and flags the anomalies -- then renders it to an
+    actual .docx and verifies the file opens and contains expected text.
+    """
+    print()
+    print("=" * 70)
+    print("Testing instance-specific narrative generation end-to-end")
+    print("=" * 70)
+
+    from informacast_report.narrative import build_narrative
+    from informacast_report.render_narrative_docx import render_narrative_docx
+    from informacast_report.resources import RESOURCES
+
+    settings = Settings(token="fake-token", base_url="https://api.icmobile.singlewire.com/api/v1", timeout=30)
+    client = FusionApiClient(settings)
+
+    fake_data = {
+        "/facilities": [],
+        "/users": [],
+        "/distribution-lists": [
+            {"id": "dl1", "name": "All Staff"},          # referenced by a template
+            {"id": "dl2", "name": "Unused Overflow List"},  # NOT referenced -- should be flagged
+        ],
+        "/device-groups": [
+            {"id": "dg1", "name": "Building A Speakers", "additionIds": ["p1", "p2"],
+             "numPhones": 0, "numSpeakers": 12, "numIdns": 0},
+            {"id": "dg2", "name": "Empty Leftover Group",  # should be flagged as empty
+             "additionIds": [], "filters": None, "logicalExpression": None, "baseDeviceGroupIds": []},
+        ],
+        "/message-templates": [
+            {"id": "mt1", "name": "Fire Alarm", "distributionListIds": ["dl1"],
+             "deviceGroupIds": ["dg1"], "confirmationRequestId": None, "notificationProfileId": None,
+             "incidentPlanId": None, "ttsVoiceId": None},
+        ],
+        "/dialcast-dialing-configurations": [
+            {
+                "id": "dc1", "name": "Fire Line", "dialingPatternRegex": "^5551\\d{3}$",
+                "endpointIds": ["ep1"], "fallbackNotification": None,
+                "notification": {"messageTemplateId": "mt1"},  # references shared template
+            },
+            {
+                "id": "dc2", "name": "Direct Page Line", "dialingPatternRegex": "^5559999$",
+                "endpointIds": [], "fallbackNotification": {"foo": "bar"},
+                "notification": {"distributionListIds": ["dl1"], "deviceGroupIds": []},  # embedded, no template
+            },
+        ],
+        "/dialcast-dialing-configurations/dc1/rule-actions": [
+            {"id": "ra1", "name": "Notify Security Webhook"},
+        ],
+        "/dialcast-dialing-configurations/dc2/rule-actions": [],
+        "/dialcast-phone-exceptions": [],
+        "/extensions": [
+            {"id": "ext1", "name": "SchoolMessenger Connector"},
+        ],
+        "/extensions/ext1/devices": [{"id": "d1", "name": "SM Device 1"}],
+        "/extensions/ext1/endpoints": [{"id": "ep1", "name": "Fire Alarm Endpoint", "type": "SCHOOL_MESSENGER"}],
+        "/scenarios": [],
+        "/alarms": [
+            {"id": "al1", "type": "fusion_server_red", "status": "CRITICAL", "muted": False},
+            {"id": "al2", "type": "license_expiring", "status": "OK", "muted": False},
+        ],
+        "/alarms/al1/actions": [],
+        "/alarms/al1/events": [],
+        "/alarms/al2/actions": [],
+        "/alarms/al2/events": [],
+    }
+
+    def fake_paged(self, path, facility_id=None, extra_params=None, limit=100, stats=None, pagination_style="cursor"):
+        data = fake_data.get(path)
+        if data is None:
+            raise ApiError(f"404 Not Found for {path}", 404, path)
+        yield from data
+
+    with patch.object(FusionApiClient, "paged_get", fake_paged):
+        specs = [
+            r for r in RESOURCES
+            if r.key in (
+                "facilities", "users", "distribution_lists", "device_groups", "message_templates",
+                "dial_cast", "dial_cast_phone_exceptions", "extensions", "scenarios", "alarms",
+            )
+        ]
+        crawler = Crawler(client, specs=specs)
+        report = crawler.run()
+
+    narrative = build_narrative(report)
+    fr = report.facilities[0]
+
+    # -- Confirm the DialCast -> template chain resolved correctly --
+    dial_cast_section = next(s for s in narrative.sections if s.heading == "DialCast: Dial-Pattern Triggers")
+    table = dial_cast_section.tables[0]
+    by_name = {row[0]: row for row in table.rows}
+
+    assert "template: Fire Alarm" in by_name["Fire Line"][3], f"Expected Fire Line to resolve to its template, got: {by_name['Fire Line']}"
+    assert by_name["Fire Line"][2] == "Fire Alarm Endpoint", "Endpoint id should resolve to its name via the Extension tree"
+    assert by_name["Fire Line"][4] == "1", "Fire Line should show 1 linked Rule Action"
+
+    assert "embedded notification" in by_name["Direct Page Line"][3]
+    assert "All Staff" in by_name["Direct Page Line"][3], "Direct Page Line's embedded recipients should resolve to a name"
+    assert by_name["Direct Page Line"][5] == "yes", "Direct Page Line has a fallback notification"
+
+    print("  ✓ DialCast -> Message Template chain resolved correctly (Fire Line -> Fire Alarm template)")
+    print("  ✓ DialCast -> embedded recipients resolved correctly (Direct Page Line -> All Staff)")
+    print("  ✓ DialCast -> Extension endpoint name resolved correctly (ep1 -> Fire Alarm Endpoint)")
+    print("  ✓ DialCast -> nested Rule Action count correct (Fire Line: 1, Direct Page Line: 0)")
+
+    # -- Confirm anomaly detection fired correctly --
+    anomalies_section = next(s for s in narrative.sections if s.heading == "Things Worth Verifying in This Facility")
+    notes_text = " ".join(anomalies_section.notes)
+    assert "Empty Leftover Group" in notes_text, "Empty device group should be flagged"
+    assert "Unused Overflow List" in notes_text, "Unreferenced distribution list should be flagged"
+    print("  ✓ Anomaly detection correctly flagged the empty Device Group and unreferenced Distribution List")
+
+    # -- Confirm monitoring section flags the unhealthy, unmuted alarm --
+    monitoring_section = next(s for s in narrative.sections if s.heading == "Monitoring & Operational State")
+    monitoring_notes = " ".join(monitoring_section.notes)
+    assert "1 alarm" in monitoring_notes
+    print("  ✓ Unhealthy/unmuted alarm correctly flagged in Monitoring section")
+
+    # -- Render to an actual docx and confirm it opens and contains expected content --
+    out_path = "/tmp/narrative_test.docx"
+    render_narrative_docx(narrative, out_path)
+
+    from docx import Document as DocxDocument
+    doc = DocxDocument(out_path)
+    full_text = "\n".join(p.text for p in doc.paragraphs)
+    for t in doc.tables:
+        for row in t.rows:
+            full_text += "\n" + " | ".join(c.text for c in row.cells)
+
+    assert "InformaCast Fusion — Operational Narrative" in full_text
+    assert "Fire Line" in full_text and "Fire Alarm" in full_text
+    assert "Empty Leftover Group" in full_text
+    print(f"  ✓ Rendered .docx opens correctly and contains expected content ({len(doc.paragraphs)} paragraphs, {len(doc.tables)} tables)")
+
+    print("Narrative end-to-end test PASSED")
+
+
 if __name__ == "__main__":
     main()
     test_logging_levels()
@@ -795,4 +938,5 @@ if __name__ == "__main__":
     test_facility_terminology_and_header()
     test_diagnostic_mode()
     test_json_render_and_unit_filter()
+    test_narrative_end_to_end()
     print("\nALL SMOKE TESTS PASSED")

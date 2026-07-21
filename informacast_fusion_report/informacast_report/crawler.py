@@ -65,6 +65,8 @@ class FacilityReport:
     sites_tree: list[dict] = field(default_factory=list)  # sites -> buildings -> floors -> zones
     alarm_details: list[dict] = field(default_factory=list)  # alarms with nested actions/events
     extension_tree: list[dict] = field(default_factory=list)  # extensions -> devices + endpoints
+    dial_cast_rule_actions: list[dict] = field(default_factory=list)  # each dial_cast config's nested rule actions
+    name_index: dict = field(default_factory=dict)  # id -> display name, across every resource (including nested)
 
 
 @dataclass
@@ -162,6 +164,9 @@ class Crawler:
         fr.extension_tree = self._crawl_extension_tree(fr, facility_id)
         logger.progress("Extension tree: %d extension(s)", len(fr.extension_tree))
 
+        logger.progress("Fetching DialCast rule actions...")
+        fr.dial_cast_rule_actions = self._crawl_dialcast_rule_actions(fr, facility_id)
+
         logger.progress("Resolving cross-referenced IDs to names...")
         self._resolve_references(fr)
         return fr
@@ -234,6 +239,29 @@ class Crawler:
             tree.append(ext_node)
         return tree
 
+    def _crawl_dialcast_rule_actions(self, fr: FacilityReport, facility_id: Optional[str]) -> list[dict]:
+        """Each DialCast Dialing Configuration can have its own nested Rule
+        Actions (`/dialcast-dialing-configurations/{id}/rule-actions`,
+        confirmed via the OpenAPI spec) -- these are easy to miss if only
+        looking at the configuration's own `notification` field, since they
+        can trigger additional effects beyond the visible notification.
+        """
+        dial_cast_result = fr.resources.get("dial_cast")
+        if not dial_cast_result or not dial_cast_result.items:
+            return []
+
+        details = []
+        for config in dial_cast_result.items:
+            rule_actions = self._safe_facility_list(
+                f"/dialcast-dialing-configurations/{config['id']}/rule-actions", facility_id
+            )
+            details.append({
+                "dial_cast_id": config["id"],
+                "dial_cast_name": config.get("name", config["id"]),
+                "rule_actions": rule_actions,
+            })
+        return details
+
     def _safe_facility_list(self, path: str, facility_id: Optional[str]) -> list[dict]:
         try:
             return list(self.client.paged_get(path, facility_id=facility_id))
@@ -247,8 +275,16 @@ class Crawler:
         """Populate a `<field>_resolved` companion attribute on every item
         for any ref_field that points at a resource we also crawled, mapping
         id(s) to display name(s) instead of leaving them as opaque UUIDs.
+
+        The name index also includes nested resources (Sites' Buildings/
+        Floors/Zones, Extensions' Devices/Endpoints) even though those aren't
+        top-level ResourceSpecs — otherwise a reference like a Gateway's
+        `buildingId` or a DialCast config's `endpointIds` would never
+        resolve, since their targets only exist inside `sites_tree`/
+        `extension_tree`, not `fr.resources`. The resolved index is stored
+        on the FacilityReport itself (`fr.name_index`) so other consumers
+        (e.g. the narrative generator) can reuse it without rebuilding it.
         """
-        # Build id -> name lookup across every resource in this facility.
         name_index: dict[str, str] = {}
         for result in fr.resources.values():
             name_field = result.spec.name_field
@@ -257,6 +293,30 @@ class Crawler:
                 if item_id and name_field in item:
                     name_index[item_id] = item[name_field] or item_id
 
+        for site in fr.sites_tree:
+            if site.get("id"):
+                name_index[site["id"]] = site.get("name", site["id"])
+            for building in site.get("buildings", []):
+                if building.get("id"):
+                    name_index[building["id"]] = building.get("name", building["id"])
+                for floor in building.get("floors", []):
+                    if floor.get("id"):
+                        name_index[floor["id"]] = floor.get("name", floor["id"])
+                    for zone in floor.get("zones", []):
+                        if zone.get("id"):
+                            name_index[zone["id"]] = zone.get("name", zone["id"])
+
+        for ext in fr.extension_tree:
+            if ext.get("id"):
+                name_index[ext["id"]] = ext.get("name", ext["id"])
+            for device in ext.get("devices", []):
+                if device.get("id"):
+                    name_index[device["id"]] = device.get("name", device["id"])
+            for endpoint in ext.get("endpoints", []):
+                if endpoint.get("id"):
+                    name_index[endpoint["id"]] = endpoint.get("name", endpoint["id"])
+
+        fr.name_index = name_index
         logger.debug("Built name index with %d entries for reference resolution", len(name_index))
 
         for result in fr.resources.values():

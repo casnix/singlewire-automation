@@ -19,6 +19,13 @@ Examples:
     python main.py --format json --unit users
     python main.py --format json --unit users,message_templates --output subset.json
 
+    # Instance-specific operational narrative (Word doc): explains how THIS
+    # instance's configured resources actually relate to each other --
+    # e.g. which DialCast pattern fires which template to which recipients --
+    # rather than a raw data dump. See docs/RESOURCE_MODEL.md for the
+    # conceptual version of the same relationships.
+    python main.py --format narrative --output ops_narrative.docx
+
     # Test a single resource in isolation (no report generated) — use this
     # to check whether pagination is actually grabbing everything:
     python main.py --test users
@@ -44,9 +51,13 @@ from informacast_report.resources import GROUPS, RESOURCES, resources_for_groups
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "--format", choices=["html", "docx", "pdf", "json"], default="html",
+        "--format", choices=["html", "docx", "pdf", "json", "narrative"], default="html",
         help="Output report format (default: html). 'json' prints to stdout "
-             "if --output isn't given, instead of requiring a file.",
+             "if --output isn't given, instead of requiring a file. 'narrative' "
+             "produces an instance-specific operational Word document explaining "
+             "how the crawled resources relate to each other (see "
+             "docs/RESOURCE_MODEL.md for the conceptual version), rather than a "
+             "raw data dump.",
     )
     parser.add_argument(
         "--output", default=None,
@@ -200,7 +211,7 @@ def main() -> int:
             print(json_str)
         return 0
 
-    output_path = args.output or f"report.{args.format}"
+    output_path = args.output or ("narrative.docx" if args.format == "narrative" else f"report.{args.format}")
 
     if args.format == "html":
         from informacast_report.render_html import render_html
@@ -213,6 +224,11 @@ def main() -> int:
     elif args.format == "pdf":
         from informacast_report.render_html import render_pdf
         render_pdf(report, output_path)
+    elif args.format == "narrative":
+        from informacast_report.narrative import build_narrative
+        from informacast_report.render_narrative_docx import render_narrative_docx
+        narrative = build_narrative(report)
+        render_narrative_docx(narrative, output_path)
 
     log.progress("Render finished in %.2fs", time.monotonic() - render_start)
     log.info("Report written to %s", output_path)

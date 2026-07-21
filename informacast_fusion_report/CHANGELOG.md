@@ -5,6 +5,55 @@ There's no formal release/versioning process — this just tracks what changed a
 since several rounds of this were genuine bugs worth understanding rather than routine
 feature work.
 
+## Instance-specific operational narrative (`--format narrative`)
+
+`docs/RESOURCE_MODEL.md` explained how these resources relate to each other
+*conceptually* (schema-level, no instance data). This adds the same explanation
+populated with a real instance's **actual configured resources and their real
+cross-references** — resolved names, not raw IDs, tracing genuine chains rather
+than describing the schema abstractly.
+
+### Added
+- `informacast_report/narrative.py`: builds a rendering-agnostic content model
+  (sections, paragraphs, tables, callout notes) from a crawled `InstanceReport`,
+  covering Recipients, Devices, Messaging, Automation/Triggers (DialCast fully
+  traced: pattern → endpoint → notification → recipients/template → Rule Actions →
+  fallback), Telephony, Monitoring, and Admin — plus a concrete "Things Worth
+  Verifying" section that flags specific anomalies by name (empty Device Groups,
+  Distribution Lists no Message Template references, unhealthy unmuted Alarms),
+  not a generic checklist.
+- `informacast_report/render_narrative_docx.py`: renders that model as a Word
+  document styled to match `docs/templates/Claude_Word_Template.docx` (the
+  project's house style for operational documents) — exact colors/sizes
+  extracted and verified programmatically (Title 26pt bold `#1F5C99`; Heading
+  1/2 `#2E74B5`; Heading 3 `#1F4D78`; table headers bold white on `#1F5C99`
+  with zebra-striped data rows).
+- `--format narrative` wired into `main.py`, defaulting to `narrative.docx`.
+- Deliberately summarizes rather than dumps: group-level facts (a Device Group's
+  membership mechanism, device-type counts) are included, full membership lists
+  are not — large tables cap at 40 rows with an explicit "+N more" note.
+
+### Fixed
+- The crawler's name-resolution index only covered top-level resources, not
+  nested ones (Sites → Buildings/Floors/Zones, Extensions → Devices/Endpoints) —
+  a reference like a Gateway's `buildingId` or a DialCast's `endpointIds` would
+  never have resolved to a name. `_resolve_references` now folds `sites_tree`
+  and `extension_tree` into the index too, and the resulting index is exposed
+  on `FacilityReport.name_index` for reuse.
+- Added a nested crawl for each DialCast configuration's own Rule Actions
+  (`/dialcast-dialing-configurations/{id}/rule-actions`, confirmed via the
+  OpenAPI spec) — previously not crawled at all, so the "does this config have
+  anything beyond its visible notification" question had no answer.
+- **Corrected a real inaccuracy in `docs/RESOURCE_MODEL.md`** discovered while
+  building this: it claimed a DialCast configuration's embedded `notification`
+  is "self-contained, never a template reference." Checking the actual schema
+  showed it can be a shared Message Template (`messageTemplateId`), direct
+  recipients (`distributionListIds`/`deviceGroupIds`), *or* a dynamic
+  name-pattern lookup (`messageTemplateNamePattern`/`recipientNamePattern`) —
+  and DialCast Phone Exceptions key on the **caller's** number
+  (`callingPartyRegex`), not carve-outs from the dialed pattern as previously
+  described. Both corrected with the real field names.
+
 ## OpenAPI spec validation: Facility/Domain fix, corrected paths, new resource types
 
 A real OpenAPI spec (`spec.json`, from Singlewire's API Explorer) became available and
