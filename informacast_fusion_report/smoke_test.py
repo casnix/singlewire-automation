@@ -2,6 +2,7 @@
 crawler + both renderers work end-to-end without needing a real Fusion
 instance. Uses canned responses shaped like real API payloads.
 """
+import json
 import logging
 import sys
 sys.path.insert(0, ".")
@@ -503,6 +504,60 @@ def test_device_groups_resource_is_cursor_style():
     print("  ✓ device_groups is configured as pagination_style='cursor'")
 
 
+def test_json_render_and_unit_filter():
+    """Confirm render_json produces valid, complete JSON, and that
+    resources_for_keys (--unit) correctly restricts to exact resource keys.
+    """
+    print()
+    print("=" * 70)
+    print("Testing JSON rendering and --unit resource-key filtering")
+    print("=" * 70)
+
+    from informacast_report.resources import RESOURCES, resources_for_keys
+    from informacast_report.render_json import build_json_dict, render_json
+
+    settings = Settings(token="fake-token", base_url="https://api.icmobile.singlewire.com/api/v1", timeout=30)
+    client = FusionApiClient(settings)
+
+    with patch.object(FusionApiClient, "paged_get", fake_paged_get):
+        # --unit users,distribution_lists should crawl ONLY those two specs.
+        unit_specs = resources_for_keys(["users", "distribution_lists"])
+        assert [s.key for s in unit_specs] == ["users", "distribution_lists"]
+
+        crawler = Crawler(client, specs=unit_specs)
+        report = crawler.run()
+
+    domain_resources = report.domains[0].resources
+    assert set(domain_resources.keys()) == {"users", "distribution_lists"}, (
+        f"Expected only users+distribution_lists to be crawled with --unit, got "
+        f"{set(domain_resources.keys())}"
+    )
+
+    # Unknown key must raise KeyError with a helpful message, not crash weirdly.
+    try:
+        resources_for_keys(["totally_bogus_key"])
+        raise AssertionError("Expected KeyError for an unknown --unit key")
+    except KeyError as exc:
+        assert "Unknown resource key" in str(exc) and "Valid keys:" in str(exc)
+        print(f"  ✓ Unknown --unit key correctly raises: {exc}")
+
+    # Now render that restricted report as JSON and sanity-check structure.
+    json_str = render_json(report)
+    parsed = json.loads(json_str)  # must be valid JSON
+
+    assert parsed["base_url"] == settings.base_url
+    assert len(parsed["domains"]) == 1
+    resources_json = parsed["domains"][0]["resources"]
+    assert set(resources_json.keys()) == {"users", "distribution_lists"}
+    assert resources_json["users"]["item_count"] == 2
+    assert resources_json["users"]["items"][0]["name"] == "Jane Admin"
+    assert resources_json["distribution_lists"]["pagination_style"] == "offset"
+
+    print(f"  ✓ JSON parses cleanly and contains exactly the --unit-filtered resources.")
+    print(f"  Sample: {json_str[:200]}...")
+    print("JSON render / --unit filter test PASSED")
+
+
 if __name__ == "__main__":
     main()
     test_logging_levels()
@@ -514,4 +569,5 @@ if __name__ == "__main__":
     test_cursor_style_pagination()
     test_device_groups_resource_is_cursor_style()
     test_diagnostic_mode()
+    test_json_render_and_unit_filter()
     print("\nALL SMOKE TESTS PASSED")

@@ -8,6 +8,17 @@ Examples:
     python main.py --format html --groups access,messaging --verbose
     python main.py --format html --debug
 
+    # JSON output -- prints to stdout if --output isn't given, so it's
+    # pipeable straight into jq etc.:
+    python main.py --format json
+    python main.py --format json --output report.json
+
+    # --unit restricts to exact resource key(s) (see --list-resources),
+    # more precise than --groups. Combine with --format json to pull just
+    # one resource's raw data:
+    python main.py --format json --unit users
+    python main.py --format json --unit users,message_templates --output subset.json
+
     # Test a single resource in isolation (no report generated) — use this
     # to check whether pagination is actually grabbing everything:
     python main.py --test users
@@ -26,23 +37,35 @@ from informacast_report.config import ConfigError, Settings
 from informacast_report.crawler import Crawler
 from informacast_report.diagnostics import test_resource
 from informacast_report.logging_utils import setup_logging
-from informacast_report.resources import GROUPS, RESOURCES, resources_for_groups
+from informacast_report.resources import GROUPS, RESOURCES, resources_for_groups, resources_for_keys
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "--format", choices=["html", "docx", "pdf"], default="html",
-        help="Output report format (default: html)",
+        "--format", choices=["html", "docx", "pdf", "json"], default="html",
+        help="Output report format (default: html). 'json' prints to stdout "
+             "if --output isn't given, instead of requiring a file.",
     )
     parser.add_argument(
         "--output", default=None,
-        help="Output file path (default: report.<format>)",
+        help="Output file path (default: report.<format>; for --format json "
+             "with no --output, prints to stdout instead).",
     )
     parser.add_argument(
         "--groups", default=None,
-        help=f"Comma-separated subset of resource groups to crawl. "
-             f"Available: {', '.join(GROUPS.keys())}. Default: all.",
+        help=f"Comma-separated subset of resource GROUPS (categories) to crawl. "
+             f"Available: {', '.join(GROUPS.keys())}. Default: all. For exact "
+             f"resource(s) instead of a whole category, use --unit.",
+    )
+    parser.add_argument(
+        "--unit", default=None, metavar="KEY[,KEY...]",
+        help="Comma-separated exact resource key(s) to crawl, using the same keys "
+             "shown by --list-resources (e.g. `--unit users` or "
+             "`--unit users,message_templates`). More precise than --groups, which "
+             "pulls in an entire category — --unit pulls in only what's named. "
+             "Takes precedence over --groups if both are given. Most useful paired "
+             "with `--format json` to pull just one resource's raw data.",
     )
     parser.add_argument(
         "--test", default=None, metavar="KEY[,KEY...]",
@@ -126,8 +149,16 @@ def main() -> int:
             print("One or more resources reported an error or mismatch — see above.")
         return 0 if all_ok else 1
 
-    selected_groups = set(args.groups.split(",")) if args.groups else None
-    specs = resources_for_groups(selected_groups)
+    if args.unit:
+        keys = [k.strip() for k in args.unit.split(",") if k.strip()]
+        try:
+            specs = resources_for_keys(keys)
+        except KeyError as exc:
+            log.error(str(exc))
+            return 1
+    else:
+        selected_groups = set(args.groups.split(",")) if args.groups else None
+        specs = resources_for_groups(selected_groups)
 
     crawler = Crawler(client, specs=specs)
 
@@ -138,10 +169,26 @@ def main() -> int:
         log.error("Fatal API error: %s", exc)
         return 1
 
-    output_path = args.output or f"report.{args.format}"
-
     log.progress("Rendering %s report...", args.format)
     render_start = time.monotonic()
+
+    if args.format == "json":
+        from informacast_report.render_json import render_json
+        json_str = render_json(report)
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(json_str)
+            log.progress("Render finished in %.2fs", time.monotonic() - render_start)
+            log.info("Report written to %s", args.output)
+        else:
+            # No --output given: print to stdout instead of forcing a file,
+            # so this is pipeable, e.g.:
+            #   python main.py --format json --unit users | jq '.domains[0].resources.users.items'
+            log.progress("Render finished in %.2fs", time.monotonic() - render_start)
+            print(json_str)
+        return 0
+
+    output_path = args.output or f"report.{args.format}"
 
     if args.format == "html":
         from informacast_report.render_html import render_html

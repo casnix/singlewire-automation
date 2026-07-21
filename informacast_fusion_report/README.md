@@ -89,6 +89,69 @@ python main.py --test users --domain-id 159e9330-232a-11e4-8e47-685b358ea847
 # editing resources.py first -- useful if --test shows duplicate/stuck
 # warnings under the default style:
 python main.py --test users --pagination-style cursor
+
+# JSON output -- prints to stdout if --output isn't given, so it's
+# pipeable straight into jq/other tools instead of requiring a file:
+python main.py --format json
+python main.py --format json --output report.json
+
+# --unit restricts to exact resource key(s) shown by --list-resources --
+# more precise than --groups (which pulls a whole category). Great paired
+# with --format json to grab just one resource's raw data:
+python main.py --format json --unit users
+python main.py --format json --unit users,message_templates | jq '.domains[0].resources.users.items'
+```
+
+### JSON output and `--unit`
+
+`--format json` renders the same crawled data as the HTML/DOCX reports, but
+as structured JSON instead of a formatted document -- useful for piping into
+`jq`, diffing between two runs, or feeding into another script. If
+`--output` isn't given, it prints to stdout (log messages go to stderr, so
+piping stdout doesn't pick up any noise); if `--output` is given, it writes
+to that file like the other formats.
+
+`--unit` is a second way to narrow what gets crawled, alongside `--groups`:
+
+| Flag | Granularity | Example |
+|---|---|---|
+| `--groups` | Whole category | `--groups access` pulls Users, Security Groups, Identity Providers, etc. |
+| `--unit` | Exact resource(s) | `--unit users` pulls *only* Users |
+
+`--unit` takes the same keys shown by `--list-resources` and takes
+precedence over `--groups` if both are given. This is the fastest way to
+pull just the data you need:
+
+```bash
+python main.py --format json --unit users,distribution_lists --output subset.json
+```
+
+The JSON structure mirrors the report's domain/resource organization:
+
+```json
+{
+  "base_url": "...",
+  "generated_at": "...",
+  "domains": [
+    {
+      "domain": null,
+      "resources": {
+        "users": {
+          "key": "users", "label": "Users", "path": "/users",
+          "group": "access", "pagination_style": "offset", "notes": null,
+          "error": null,
+          "pagination_stats": {"pages": 1, "items": 2, "raw_items": 2,
+                                "duplicates": 0, "advertised_total": 2,
+                                "truncated": false},
+          "item_count": 2,
+          "items": [ {"id": "u1", "name": "..."}, ... ]
+        }
+      },
+      "sites_tree": [],
+      "alarm_details": []
+    }
+  ]
+}
 ```
 
 ### Logging levels at a glance

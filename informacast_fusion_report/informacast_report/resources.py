@@ -324,3 +324,14 @@ def get_resource(key: str) -> ResourceSpec:
     except KeyError:
         valid = ", ".join(sorted(RESOURCE_BY_KEY.keys()))
         raise KeyError(f"Unknown resource key {key!r}. Valid keys: {valid}")
+
+
+def resources_for_keys(keys: list) -> list[ResourceSpec]:
+    """Look up a list of ResourceSpecs by exact key (as shown by
+    --list-resources), preserving the order given. Used by the --unit CLI
+    filter, which is more precise than --groups: --groups pulls in every
+    resource in a category, while --unit pulls in exactly the resource(s)
+    named and nothing else. Raises KeyError (with a list of valid keys) on
+    the first unrecognized key.
+    """
+    return [get_resource(k) for k in keys]
