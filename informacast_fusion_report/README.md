@@ -1,10 +1,14 @@
 # InformaCast Fusion Configuration Report
 
 Pulls the full configuration of a Singlewire InformaCast **Fusion** instance via its
-cloud REST API and renders it as an HTML, Word (.docx), or PDF report.
+cloud REST API and renders it as an HTML, Word (.docx), JSON, or PDF report.
 
 This is a **read-only** tool — it only ever issues `GET` requests. It never creates,
 updates, or deletes anything in your instance.
+
+> See [`CHANGELOG.md`](./CHANGELOG.md) for the full history of what's changed and why —
+> several rounds of real bugs were found and fixed (pagination, a Facility/Domain
+> mix-up, wrong resource paths), and it's worth knowing which ones affect you.
 
 ## What it does
 
@@ -24,6 +28,26 @@ updates, or deletes anything in your instance.
    each Extension's Devices/Endpoints, since none of those exist as flat top-level lists.
 7. Renders everything into a single report via Jinja2 (HTML), python-docx (Word),
    HTML→PDF (WeasyPrint), or structured JSON.
+
+### Granular notification/device/recipient resources
+
+These were added specifically to cover finer-grained config that a plain "Messaging" or
+"Recipients" section wouldn't otherwise surface, and every path below is confirmed
+against the real OpenAPI spec (see `CHANGELOG.md` for what that process caught):
+
+| Key | Covers |
+|---|---|
+| `dial_cast`, `dial_cast_phone_exceptions` | DialCast dial-in triggers and their exceptions |
+| `inbound_cap_rules` | Inbound Common Alerting Protocol triggers |
+| `inbound_email` | Inbound email triggers (each with nested outbound reply rules) |
+| `inbound_rss_feeds` | Inbound RSS feed triggers |
+| `active_callaware_calls` | CallAware's only GET endpoint — live monitored-call state, not saved config |
+| `gateways` | Paging/LPI and other gateway types |
+| `ip_speakers`, `ip_speaker_sip_parameters`, `ip_speaker_jobs`, `ip_speaker_settings` | IP Speaker devices, their SIP registration, bulk jobs, and global settings |
+| `tts_voices`, `tts_lexicons`, `tts_defaults` | Text-to-speech voices, custom pronunciation lexicons, and per-locale defaults |
+| `incidents` | Runtime Incident instances (as opposed to `incident_plans`, which are the templates) |
+
+Run `python main.py --list-resources` for the complete, current list across every group.
 
 ## Before you run this
 
